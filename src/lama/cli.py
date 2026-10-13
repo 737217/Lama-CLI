@@ -17,8 +17,10 @@ from lama.ui.actions import (
     copy_flow,
     create_flow,
     delete_flow,
+    install_flow,
     monitor_screen,
     open_session,
+    path_flow,
     print_installed,
     print_running,
     pull_flow,
@@ -292,6 +294,28 @@ def server_restart(ctx: typer.Context) -> None:
 def server_logs(ctx: typer.Context) -> None:
     """Показать журнал systemd или файл процесса lama."""
     _server(ctx, "logs")
+
+
+@server_app.command("install", help=t("Download and run the official Ollama installer."))
+@guarded
+def server_install(ctx: typer.Context) -> None:
+    """Скачать и запустить официальный установщик Ollama."""
+    session = open_session(current_settings(ctx))
+    try:
+        install_flow(session)
+    finally:
+        session.client.close()
+
+
+@server_app.command("path", help=t("Add the Ollama directory to PATH."))
+@guarded
+def server_path(ctx: typer.Context) -> None:
+    """Добавить каталог Ollama в PATH."""
+    session = open_session(current_settings(ctx))
+    try:
+        path_flow(session)
+    finally:
+        session.client.close()
 
 
 @typer_app.command("info", help=t("Ollama version, command compatibility, and a resource snapshot."))

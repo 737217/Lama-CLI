@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 from rich import box
@@ -17,7 +18,22 @@ from lama.monitor.resources import CpuInfo, GpuInfo, MemoryInfo, Snapshot
 from lama.ollama.types import InstalledModel, ModelShow, RunningModel
 from lama.server.manager import ControlMode, ServerStatus
 
-console = Console()
+
+def _console_size() -> tuple[int, int] | None:
+    """COLUMNS задаёт ширину. На Windows rich иначе берёт 80 для перенаправленного вывода."""
+    raw = os.environ.get("COLUMNS", "").strip()
+    if not raw.isdigit():
+        return None
+    width = int(raw)
+    if width <= 0:
+        return None
+    lines = os.environ.get("LINES", "").strip()
+    height = int(lines) if lines.isdigit() and int(lines) > 0 else 25
+    return width, height
+
+
+_size = _console_size()
+console = Console(width=_size[0], height=_size[1]) if _size is not None else Console()
 
 _BAR_WIDTH = 20
 _SLOT_WIDTH = 6
@@ -38,7 +54,9 @@ def _mode_label(mode: ControlMode) -> str:
 
 
 def show_error(message: str) -> None:
-    console.print(Panel(Text(message), title=t("Error"), border_style="red", expand=False))
+    console.print(
+        Panel(Text(message, overflow="fold"), title=t("Error"), border_style="red", expand=False)
+    )
 
 
 def show_success(message: str) -> None:

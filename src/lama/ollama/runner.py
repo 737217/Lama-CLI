@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ from pathlib import Path
 from lama.config import Settings
 from lama.errors import OllamaCommandError, OllamaUnavailable
 from lama.i18n import t
+from lama.platform.host import locate_ollama
 
 
 @dataclass(frozen=True)
@@ -82,14 +82,19 @@ class OllamaRunner:
         self.settings = settings
         self._binary = binary
 
+    def pin(self, binary: str) -> None:
+        self._binary = binary
+
     def binary(self) -> str:
         if self._binary:
             return self._binary
-        found = shutil.which("ollama")
-        if not found:
-            raise OllamaUnavailable(t("The ollama command was not found in PATH. Install Ollama and try again."))
-        self._binary = found
-        return found
+        located = locate_ollama()
+        if located is None:
+            raise OllamaUnavailable(
+                t("The ollama command was not found. Install it from the Server menu or with lama server install.")
+            )
+        self._binary = str(located.path)
+        return self._binary
 
     def environment(self) -> dict[str, str]:
         env = os.environ.copy()
