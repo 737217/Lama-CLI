@@ -7,7 +7,8 @@ import sys
 from ctypes import c_char, c_int, c_int32, c_uint32, c_uint64
 from dataclasses import dataclass
 
-_PROC_PIDTASKALLINFO = 2
+# Flavor для буфера proc_bsdinfo. Значение 2 — proc_taskallinfo, и ядро отвергает меньший буфер.
+_PROC_PIDTBSDINFO = 3
 _PROC_PIDPATHINFO_MAXSIZE = 4096
 _CTL_KERN = 1
 _KERN_PROCARGS2 = 49
@@ -102,7 +103,7 @@ def _read_open(pid: int) -> DarwinProcessRead:
         ctypes.c_int,
     ]
     libproc.proc_pidinfo.restype = ctypes.c_int
-    written = libproc.proc_pidinfo(pid, _PROC_PIDTASKALLINFO, 0, ctypes.byref(info), ctypes.sizeof(info))
+    written = libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), ctypes.sizeof(info))
     if written <= 0:
         if ctypes.get_errno() == _ESRCH:
             return DarwinProcessRead("gone")
