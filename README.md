@@ -1,65 +1,67 @@
 # lama
 
-Интерактивная консольная утилита для локальной [Ollama](https://ollama.com). Вместо того чтобы помнить `ollama run`, `ollama pull` и `ollama create`, запустите `lama`, выберите действие стрелками и ответьте на вопросы.
+[Русский](README-RU.md)
 
-`lama` не запускает модели сама. Чат идёт через штатную команду `ollama run`, остальные операции — через её CLI или HTTP API.
+An interactive console tool for a local [Ollama](https://ollama.com). Instead of remembering `ollama run`, `ollama pull`, and `ollama create`, start `lama`, pick an action with the arrow keys, and answer the questions.
 
-Проверено с клиентом Ollama 0.32. Целевая система — Ubuntu.
+`lama` does not run models itself. Chat goes through the regular `ollama run` command. Everything else goes through the Ollama CLI or its HTTP API.
 
-## Установка
+Tested with the Ollama 0.32 client. The target system is Ubuntu.
 
-Нужны Python 3.12+, [uv](https://docs.astral.sh/uv/) и установленная команда `ollama`.
+## Installation
 
-Из корня этого репозитория:
+You need Python 3.12+, [uv](https://docs.astral.sh/uv/), and the `ollama` command installed.
+
+From the root of this repository:
 
 ```bash
 uv tool install .
 ```
 
-После этого команда `lama` доступна из любого каталога.
+After that, `lama` is available from any directory.
 
-Обновление из того же каталога:
+Update from the same directory:
 
 ```bash
 uv tool install . --reinstall
 ```
 
-Если утилита опубликована и видна uv как инструмент `lama`:
+If the tool is published and uv sees it as the `lama` tool:
 
 ```bash
 uv tool upgrade lama
 ```
 
-Удаление:
+Removal:
 
 ```bash
 uv tool uninstall lama
 ```
 
-Проверка для разработки без установки в систему:
+Check it during development without installing it system-wide:
 
 ```bash
 uv sync
 uv run lama --help
 ```
 
-## Язык
+## Language
 
-По умолчанию интерфейс английский. Пункт меню Language сохраняет выбор в `~/.config/lama/config.toml`, и следующее меню сразу открывается на русском или английском. `LAMA_LANG=ru` или `LAMA_LANG=en` перекрывает сохранённый язык на один запуск и файл не меняет.
+The interface is English by default. The Language menu item saves the choice in `~/.config/lama/config.toml`, and the next menu opens in Russian or English immediately. `LAMA_LANG=ru` or `LAMA_LANG=en` overrides the saved language for one launch and does not change the file.
 
-## Меню
+## Menu
 
 ```bash
 lama
 ```
 
-Стрелки ↑↓ выбирают пункт, Enter подтверждает, Esc возвращает на шаг назад. В списках моделей можно набрать часть имени, чтобы отфильтровать их. Ctrl+C в меню завершает утилиту. Ctrl+C во время чата или скачивания прерывает только эту операцию и возвращает в меню.
+The ↑↓ arrows select an item, Enter confirms it, and Esc goes back one step. In model lists you can type part of a name to filter them. Ctrl+C in the menu exits the tool. Ctrl+C during a chat or a download interrupts only that operation and returns to the menu.
 
-В шапке видно, отвечает ли сервер и сколько моделей установлено. Если Ollama не запущена, меню всё равно откроется: модели будут недоступны, управление сервером — нет.
+The header shows whether the server is responding and how many models are installed. If Ollama is not running, the menu still opens: models are unavailable, and server control is not.
 
-## Прямые команды
+## Direct commands
 
-Команда без обязательного аргумента открывает тот же мастер, что и пункт меню, и после завершения выходит.
+A command without a required argument opens the same wizard as the menu item, then exits when it finishes.
 
 ```bash
 lama run
@@ -86,41 +88,43 @@ lama info
 lama --help
 ```
 
-`lama run gemma4:12b` сразу открывает интерактивный чат Ollama. `lama run` без имени сначала спрашивает модель и способ запуска: чат, загрузка в память без чата или свои настройки.
+`lama run gemma4:12b` opens the interactive Ollama chat immediately. `lama run` without a name first asks for a model and how to start it: a chat, a load into memory without a chat, or custom settings.
 
-## Что умеет меню
+`lama monitor` asks whether to refresh live or show a snapshot, then displays CPU, RAM, GPU, and loaded models. Live refresh updates the screen every 2 seconds; quit with `q` or Esc.
 
-- Запуск чата через `ollama run` с передачей терминала как есть.
-- Загрузка модели в память без чата (`POST /api/generate` с пустым промптом и `keep_alive`) и выгрузка через `ollama stop`. Если команда недоступна, используется API с `keep_alive: 0`. Это не остановка сервера и не зависит от того, локальный адрес выбран или удалённый: модель уходит в выбранный API, локальная служба при этом не трогается.
-- Скачивание с прогрессом, выбором тега из реестра Ollama, если он доступен, и ссылками Hugging Face вида `hf.co/user/repo:Q4_K_M`. Список моделей в код не зашит. Можно открыть каталог <https://ollama.com/library>.
-- Создание модели из установленной, из локального GGUF или из готового Modelfile. В файл попадают только изменённые параметры: `num_ctx`, `num_batch`, `num_gpu`, `temperature`, `top_p`, `top_k`, `repeat_penalty`, `num_predict`, `seed` и `SYSTEM`. `num_gpu` — это число слоёв на GPU (`-1` авто, `0` только CPU), а не число видеокарт.
-- `keep_alive` в Modelfile не записывается: установленная Ollama так не принимает. Значение сохраняется в конфиге lama и передаётся при запуске (`ollama run --keepalive` или API).
-- Таблица установленных моделей и действия с выбранной: запуск, сведения, копия, настройка, удаление.
-- Загруженные модели: имя, память, VRAM, оценка CPU (только если API прислал и общий размер, и `size_vram`), время выгрузки и контекст. Отсутствующие поля показываются как «—».
-- Настройка создаёт новую модель. Существующая перезаписывается только если вы выбрали то же имя и явно подтвердили это.
-- Удаление спрашивает подтверждение. `--yes` отключает вопрос в прямой команде.
-- Публикация через `ollama push`. Имя должно быть `username/model`. Если нет `~/.ollama/id_ed25519.pub`, lama предложит `ollama signin` и не отправит модель вслепую.
-- Сервер: проверка API и версии. Управлять процессом и systemd можно только для loopback на этой машине (`localhost`, `127.0.0.0/8`, `::1`). Удалённый адрес и wildcard (`0.0.0.0`, `::`) только проверяются: lama не вызывает локальный `systemctl`, не стартует `ollama serve`, не шлёт сигналы и не выдаёт локальный журнал за журнал этого адреса. Произвольное имя хоста не считается локальным и не резолвится.
-- Локальный backend выбирается по фактам. Опрашиваются и system-, и user-служба, а также свой процесс. Активна только служба с `ActiveState=active`. Активная user-служба важнее просто установленной, но неактивной system-службы. Ответ API сам по себе не доказывает, что отвечает именно эта служба: если службы молчат, а API отвечает, это внешний процесс. Две активные службы или активная служба вместе со своим процессом lama — неоднозначность: запуск, остановка и перезапуск блокируются. Когда сервер остановлен, способ запуска такой: установленная system-служба, иначе user-служба, иначе свой `ollama serve`. Нет `systemctl` или user-шины — эти варианты просто недоступны, без `sudo` и без поиска процесса по имени.
-- Свой процесс опознаётся файлом состояния: PID, время старта из `/proc/<pid>/stat` (поле `comm` может содержать пробелы и скобки), путь программы, uid и выбранный адрес. Совпадения PID и команды `ollama serve` недостаточно. Перед сигналом и ещё раз перед SIGKILL запись сверяется заново. Старый файл только с PID и повреждённая запись не разрешают завершать процесс. Если процесс уже исчез или это уже другой процесс, чужой PID сигнал не получает.
-- Ресурсы: загрузка CPU из `/proc/stat` и средняя из `/proc/loadavg`, RAM из `/proc/meminfo`, загруженные модели и `nvidia-smi` (память и загрузка GPU), если утилита есть и отвечает. Без NVIDIA GPU этот блок просто пропускается. `lama monitor` обновляет экран каждые 2 секунды; выход — `q` или Esc.
+## What the menu can do
 
-## Адрес сервера
+- Start a chat through `ollama run`, handing the terminal over as-is.
+- Load a model into memory without a chat (`POST /api/generate` with an empty prompt and `keep_alive`) and unload it with `ollama stop`. If that command is unavailable, the API is used with `keep_alive: 0`. This is not stopping the server, and it does not depend on whether the selected address is local or remote: the model goes to the selected API, and the local service is left alone.
+- Download with progress, a tag picked from the Ollama registry when it is available, and Hugging Face references such as `hf.co/user/repo:Q4_K_M`. The model list is not hardcoded. You can open the catalog at <https://ollama.com/library>.
+- Create a model from an installed one, a local GGUF file, or an existing Modelfile. Only changed parameters are written: `num_ctx`, `num_batch`, `num_gpu`, `temperature`, `top_p`, `top_k`, `repeat_penalty`, `num_predict`, `seed`, and `SYSTEM`. `num_gpu` is the number of layers on the GPU (`-1` auto, `0` CPU only), not the number of graphics cards.
+- `keep_alive` is not written into the Modelfile: the installed Ollama does not accept it there. The value is stored in the lama config and passed at launch (`ollama run --keepalive` or the API).
+- A table of installed models and actions for the selected one: run, details, copy, configure, delete.
+- Loaded models: name, memory, VRAM, a CPU estimate (only when the API sent both the total size and `size_vram`), unload time, and context. Missing fields are shown as "—".
+- Configure creates a new model. An existing model is overwritten only if you chose the same name and explicitly confirmed it.
+- Delete asks for confirmation. `--yes` skips the question on the direct command.
+- Publish with `ollama push`. The name must be `username/model`. If `~/.ollama/id_ed25519.pub` is missing, lama offers `ollama signin` and does not push the model blindly.
+- Server: check the API and version. Process and systemd control is available only for loopback on this machine (`localhost`, `127.0.0.0/8`, `::1`). A remote address and a wildcard (`0.0.0.0`, `::`) are only checked: lama does not call local `systemctl`, does not start `ollama serve`, does not send signals, and does not present a local log as the log for that address. An arbitrary hostname is not treated as local and is not resolved.
+- The local backend is chosen from facts. Both the system and user services are queried, along with lama's own process. Only a service with `ActiveState=active` counts as active. An active user service outranks a system service that is merely installed and inactive. An API response by itself does not prove that this service is the one answering: if the services are quiet and the API answers, it is an external process. Two active services, or an active service together with lama's own process, is ambiguous: start, stop, and restart are blocked. When the server is stopped, the start method is: an installed system service, otherwise a user service, otherwise lama's own `ollama serve`. If `systemctl` or the user bus is missing, those options are simply unavailable, with no `sudo` and no search for a process by name.
+- Lama's own process is identified by a state file: PID, start time from `/proc/<pid>/stat` (the `comm` field may contain spaces and parentheses), program path, uid, and the selected address. Matching the PID and the `ollama serve` command is not enough. The record is checked again before a signal and once more before SIGKILL. An old file that contains only a PID, and a damaged record, do not allow the process to be stopped. If the process is already gone, or it is already a different process, the foreign PID does not receive a signal.
+- Resources: CPU load from `/proc/stat` and the load average from `/proc/loadavg`, RAM from `/proc/meminfo`, loaded models, and `nvidia-smi` (GPU memory and utilization) when the utility is present and responds. Without an NVIDIA GPU that block is simply skipped. `lama monitor` refreshes the screen every 2 seconds; quit with `q` or Esc.
 
-Порядок такой: флаг `--host`, переменная `OLLAMA_HOST`, файл `~/.config/lama/config.toml`, иначе `http://127.0.0.1:11434`.
+## Server address
+
+The order is: the `--host` flag, the `OLLAMA_HOST` variable, the file `~/.config/lama/config.toml`, otherwise `http://127.0.0.1:11434`.
 
 ```bash
 lama --host 127.0.0.1:11434 list
 OLLAMA_HOST=10.0.0.2:11434 lama ps
 ```
 
-Адрес из меню «Управление сервером → Адрес подключения» пишется в конфиг. Если в окружении задан `OLLAMA_HOST`, при следующем запуске он снова важнее файла. В дочерний процесс `ollama` для обычного HTTP уходит адрес без схемы.
+The address from the menu "Server → Connection address" is written to the config. If `OLLAMA_HOST` is set in the environment, it takes priority over the file again on the next launch. For plain HTTP, the child `ollama` process receives the address without a scheme.
 
-Этот приоритет действует только когда `config.toml` удалось прочитать и известные поля в нём корректны. Синтаксическая ошибка, сбой чтения, нестроковый `host`, нетаблица `keep_alive` или неверная длительность останавливают запуск с ненулевым кодом даже при `--host` и `OLLAMA_HOST`: повреждённый файл не подменяется адресом по умолчанию и не перезаписывается. Если файла нет, используются обычные значения по умолчанию.
+This priority applies only when `config.toml` could be read and the known fields in it are valid. A syntax error, a read failure, a non-string `host`, a `keep_alive` value that is not a table, or an invalid duration stops the launch with a non-zero code even with `--host` and `OLLAMA_HOST`: a damaged file is not replaced with the default address and is not overwritten. If the file is missing, the ordinary defaults are used.
 
-Локально lama управляет сервером только для loopback. `http://10.0.0.2:11434`, имя вроде `remote.example` или `my-pc` и адрес `0.0.0.0` / `::` не дают права останавливать локальную службу. Имя `localhost` локальное, а `localhost.example` — нет.
+Locally, lama controls the server only for loopback. `http://10.0.0.2:11434`, a name such as `remote.example` or `my-pc`, and the address `0.0.0.0` / `::` do not grant the right to stop the local service. The name `localhost` is local, and `localhost.example` is not.
 
-Там же хранятся выбранные значения keep alive:
+The chosen keep-alive values are stored there as well:
 
 ```toml
 host = "http://127.0.0.1:11434"
@@ -129,13 +133,13 @@ host = "http://127.0.0.1:11434"
 "my-qwen" = "10m"
 ```
 
-Каталог состояния процесса, запущенного lama: `~/.local/state/lama/`. `ollama.log` — вывод этого процесса. `ollama.pid` — JSON с его идентичностью (`version`, `pid`, `start_time`, `executable`, `uid`, `endpoint`), а не одно число. Учитываются `XDG_CONFIG_HOME` и `XDG_STATE_HOME`.
+The state directory for a process started by lama is `~/.local/state/lama/`. `ollama.log` is the output of that process. `ollama.pid` is JSON with its identity (`version`, `pid`, `start_time`, `executable`, `uid`, `endpoint`), not a single number. `XDG_CONFIG_HOME` and `XDG_STATE_HOME` are honored.
 
-## Ошибки
+## Errors
 
-Ожидаемые ситуации — недоступный сервер, неверное имя, отказ реестра, отмена мастера, ошибка чтения или разбора `config.toml` — печатаются панелью без traceback Python. Полный traceback: `LAMA_DEBUG=1`.
+Expected situations — an unreachable server, a bad name, a registry refusal, a cancelled wizard, a read or parse error in `config.toml` — are printed as a panel without a Python traceback. For the full traceback: `LAMA_DEBUG=1`.
 
-## Разработка
+## Development
 
 ```bash
 uv sync
@@ -144,4 +148,4 @@ uv run ruff format --check .
 uv run pytest
 ```
 
-Тесты не скачивают модели и не ходят в живую Ollama: HTTP API и системные команды подменяются.
+Tests do not download models and do not talk to a live Ollama: the HTTP API and system commands are replaced.
