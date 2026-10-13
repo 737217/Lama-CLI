@@ -1,6 +1,8 @@
+import sys
 from io import StringIO
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from lama.formatting import format_percent
@@ -18,7 +20,8 @@ from lama.monitor.resources import (
     parse_proc_stat,
     query_nvidia,
 )
-from lama.ui.display import render_snapshot
+from lama.monitor.windows_metrics import cpu_times_from_counters
+from lama.ui.display import _console_size, render_snapshot
 
 
 def test_parse_meminfo() -> None:
@@ -46,6 +49,27 @@ def test_parse_nvidia_memory_controller() -> None:
     gpus = parse_nvidia_csv("NVIDIA GeForce RTX 5070, 12282, 3790, 8492, 0, 17\n")
     assert gpus[0].utilization == 0
     assert gpus[0].memory_utilization == 17
+
+
+def test_windows_cpu_counters_treat_kernel_time_as_including_idle() -> None:
+    assert cpu_times_from_counters(10, 40, 30) == (60, 70)
+
+
+def test_console_size_follows_columns_only_when_stdout_is_not_a_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLUMNS", "100")
+    monkeypatch.delenv("LINES", raising=False)
+
+    class _Stream:
+        def __init__(self, tty: bool) -> None:
+            self._tty = tty
+
+        def isatty(self) -> bool:
+            return self._tty
+
+    monkeypatch.setattr(sys, "stdout", _Stream(True))
+    assert _console_size() is None
+    monkeypatch.setattr(sys, "stdout", _Stream(False))
+    assert _console_size() == (100, 25)
 
 
 def test_cpu_load_between_samples() -> None:

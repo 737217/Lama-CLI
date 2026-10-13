@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from datetime import datetime
 
 from rich import box
@@ -19,8 +20,20 @@ from lama.ollama.types import InstalledModel, ModelShow, RunningModel
 from lama.server.manager import ControlMode, ServerStatus
 
 
+def _stdout_is_tty() -> bool:
+    isatty = getattr(sys.stdout, "isatty", None)
+    if not callable(isatty):
+        return False
+    try:
+        return bool(isatty())
+    except OSError:
+        return False
+
+
 def _console_size() -> tuple[int, int] | None:
-    """COLUMNS задаёт ширину. На Windows rich иначе берёт 80 для перенаправленного вывода."""
+    """COLUMNS задаёт ширину только для перенаправленного вывода. В tty rich следит за терминалом сам."""
+    if _stdout_is_tty():
+        return None
     raw = os.environ.get("COLUMNS", "").strip()
     if not raw.isdigit():
         return None

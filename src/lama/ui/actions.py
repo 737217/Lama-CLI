@@ -23,7 +23,8 @@ from lama.ollama.runner import OllamaRunner
 from lama.ollama.types import InstalledModel, PullEvent, RunningModel
 from lama.platform.host import current_kind, locate_ollama
 from lama.platform.host import open_catalog as open_catalog_url
-from lama.platform.install import installer_for, run_installer
+from lama.platform.install import installer_environment, installer_for, run_installer
+from lama.platform.model import PlatformKind, assert_never
 from lama.platform.persist import publish_path
 from lama.server.manager import ControlMode, ServerManager
 from lama.services import (
@@ -601,14 +602,7 @@ def open_library() -> None:
 
 
 def install_flow(session: Session) -> None:
-    spec = installer_for(current_kind())
-    console.print(Text(spec.url))
-    _need_confirm(
-        session.prompter.confirm(
-            t("Download and run the official Ollama installer from {url}?", url=spec.url),
-            default=False,
-        )
-    )
+    _confirm_official_install(session)
     _run_official_installer()
     located = locate_ollama()
     if located is None:
@@ -641,14 +635,7 @@ def _ensure_local_binary(session: Session, manager: ServerManager) -> None:
         return
     located = locate_ollama()
     if located is None:
-        spec = installer_for(current_kind())
-        console.print(Text(spec.url))
-        answer = session.prompter.confirm(
-            t("Ollama is not installed. Download the official installer from {url}?", url=spec.url),
-            default=True,
-        )
-        if answer is None or not answer:
-            raise UserCancelled()
+        _confirm_official_install(session)
         _run_official_installer()
         located = locate_ollama()
         if located is None:
@@ -663,8 +650,35 @@ def _run_official_installer() -> None:
         run_installer(current_kind(), Path(directory), execute=_installer_exit_code)
 
 
+def _confirm_official_install(session: Session) -> None:
+    kind = current_kind()
+    spec = installer_for(kind)
+    console.print(Text(spec.url))
+    _need_confirm(session.prompter.confirm(_install_prompt(kind, spec.url), default=False))
+
+
+def _install_prompt(kind: PlatformKind, url: str) -> str:
+    if kind == "linux":
+        return t(
+            "Download and run the official Ollama installer from {url}? "
+            "It may ask for sudo, install and start a systemd service, "
+            "and install the NVIDIA CUDA driver when a GPU is found.",
+            url=url,
+        )
+    if kind == "darwin":
+        return t(
+            "Download and run the official Ollama installer from {url}? "
+            "It runs pkill -x Ollama when that app is running and deletes "
+            "/Applications/Ollama.app when the app is already installed.",
+            url=url,
+        )
+    if kind == "windows":
+        return t("Download and run the official Ollama installer from {url}?", url=url)
+    return assert_never(kind)
+
+
 def _installer_exit_code(argv: list[str]) -> int:
-    completed = subprocess.run(argv, check=False)
+    completed = subprocess.run(argv, check=False, env=installer_environment(os.environ))
     return completed.returncode
 
 

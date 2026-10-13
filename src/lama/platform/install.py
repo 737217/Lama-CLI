@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from lama.platform.model import PlatformKind, assert_never
 
 _WINDOWS_URL = "https://ollama.com/install.ps1"
 _UNIX_URL = "https://ollama.com/install.sh"
+_BLOCKED_ENV = ("OLLAMA_UNINSTALL", "OLLAMA_DOWNLOAD_URL", "OLLAMA_INSTALL_DIR")
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class Installer:
 
     def argv(self, script: Path) -> list[str]:
         if self.filename.endswith(".ps1"):
-            return ["powershell", "-NoProfile", "-File", str(script)]
+            return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)]
         return ["sh", str(script)]
 
 
@@ -33,6 +34,11 @@ def installer_for(kind: PlatformKind) -> Installer:
     if kind == "linux" or kind == "darwin":
         return Installer(_UNIX_URL, "install.sh")
     return assert_never(kind)
+
+
+def installer_environment(source: Mapping[str, str]) -> dict[str, str]:
+    """Окружение установщика без переменных, которые меняют официальный скрипт."""
+    return {key: value for key, value in source.items() if key not in _BLOCKED_ENV}
 
 
 def download_installer(url: str, target: Path) -> None:

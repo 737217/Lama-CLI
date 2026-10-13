@@ -78,7 +78,19 @@ _WAIT_ATTEMPTS = 20
 _WAIT_INTERVAL = 0.25
 _IDENTITY_ATTEMPTS = 10
 _IDENTITY_INTERVAL = 0.05
+# На Windows SIGKILL нет. os.kill с любым сигналом, кроме CTRL_C_EVENT и CTRL_BREAK_EVENT,
+# вызывает TerminateProcess. CREATE_NO_WINDOW не принимает Ctrl+Break, поэтому обе остановки
+# здесь — жёсткое завершение этого PID. Дочерние процессы запрос на выход не получают.
 _FORCE_STOP = getattr(signal, "SIGKILL", 9)
+
+
+def _managed_stop_message() -> str:
+    if current_kind() == "windows":
+        return t(
+            "The ollama serve process started by lama has been stopped. "
+            "On Windows the process is terminated immediately, and its child processes are not asked to exit."
+        )
+    return t("The ollama serve process started by lama has been stopped.")
 
 
 class ControlMode(StrEnum):
@@ -722,7 +734,7 @@ class ServerManager:
         outcome = self._wait_until_changed(identity)
         if outcome == "gone":
             self._clear_state(identity)
-            return t("The ollama serve process started by lama has been stopped.")
+            return _managed_stop_message()
         if outcome == "unreadable":
             raise LamaError(t("Could not read the process again. SIGKILL was not sent, and the state file was kept."))
         if outcome == "mismatch":
@@ -732,7 +744,7 @@ class ServerManager:
         outcome = self._wait_until_changed(identity)
         if outcome == "gone":
             self._clear_state(identity)
-            return t("The ollama serve process started by lama has been stopped.")
+            return _managed_stop_message()
         if outcome == "mismatch":
             self._clear_state(identity)
             raise LamaError(t("After SIGKILL the PID already belongs to another process. No further signal was sent."))

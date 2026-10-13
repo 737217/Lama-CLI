@@ -80,6 +80,15 @@ def parse_kern_procargs2(data: bytes) -> list[str] | None:
     return arguments
 
 
+def classify_proc_pidinfo(written: int, expected: int, errno: int) -> str:
+    """``ok`` только при полном ``proc_bsdinfo``. Короткий ответ оставляет хвост нулевым."""
+    if expected > 0 and written == expected:
+        return "ok"
+    if written <= 0 and errno == _ESRCH:
+        return "gone"
+    return "unreadable"
+
+
 def read_darwin_process(pid: int) -> DarwinProcessRead:
     if pid <= 0:
         return DarwinProcessRead("gone")
@@ -103,10 +112,12 @@ def _read_open(pid: int) -> DarwinProcessRead:
         ctypes.c_int,
     ]
     libproc.proc_pidinfo.restype = ctypes.c_int
-    written = libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), ctypes.sizeof(info))
-    if written <= 0:
-        if ctypes.get_errno() == _ESRCH:
-            return DarwinProcessRead("gone")
+    expected = ctypes.sizeof(info)
+    written = libproc.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, ctypes.byref(info), expected)
+    outcome = classify_proc_pidinfo(written, expected, ctypes.get_errno())
+    if outcome == "gone":
+        return DarwinProcessRead("gone")
+    if outcome != "ok":
         return DarwinProcessRead("unreadable")
     executable = _image_path(libproc, pid)
     command = _command_line(libc, pid)

@@ -7,6 +7,8 @@ import os
 import winreg
 from pathlib import Path
 
+from lama.errors import LamaError
+from lama.i18n import t
 from lama.platform.pathfix import merge_path
 
 _ENVIRONMENT = r"Environment"
@@ -30,10 +32,19 @@ def persist_user_path(directory: Path) -> bool:
 def _read() -> str:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _ENVIRONMENT) as key:
-            value, _kind = winreg.QueryValueEx(key, "Path")
-    except OSError:
+            try:
+                value, _kind = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                return ""
+            except OSError as exc:
+                raise LamaError(t("Could not read the user PATH from the registry: {error}", error=exc)) from exc
+    except FileNotFoundError:
         return ""
-    return value if isinstance(value, str) else ""
+    except OSError as exc:
+        raise LamaError(t("Could not read the user PATH from the registry: {error}", error=exc)) from exc
+    if not isinstance(value, str):
+        raise LamaError(t("The user PATH in the registry is not text."))
+    return value
 
 
 def _write(value: str) -> None:

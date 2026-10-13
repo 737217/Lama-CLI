@@ -16,13 +16,19 @@ def merge_path(path: str, directory: str) -> str | None:
 
 
 def shell_export(directory: str) -> str:
-    quoted = directory.replace("'", "'\\''")
-    return f"export PATH='{quoted}':\"$PATH\""
+    return f"export PATH={_quote(directory)}:\"$PATH\""
 
 
-def append_export(profile: str, directory: str) -> str | None:
+def profile_line(shell: str, directory: str) -> str:
+    """Строка, которую выбранная оболочка выполнит при следующем запуске."""
+    if Path(shell).name in {"fish", "fish.exe"}:
+        return f"fish_add_path --prepend --global {_quote(directory)}"
+    return shell_export(directory)
+
+
+def append_export(profile: str, directory: str, *, shell: str = "") -> str | None:
     """Добавить одну строку экспорта. None, если такая строка уже есть."""
-    line = shell_export(directory)
+    line = profile_line(shell, directory)
     if line in profile.splitlines():
         return None
     if profile == "":
@@ -32,13 +38,20 @@ def append_export(profile: str, directory: str) -> str | None:
     return profile + "\n" + line + "\n"
 
 
-def profile_file(home: Path, shell: str) -> Path:
+def profile_file(home: Path, shell: str, *, config_home: Path | None = None) -> Path:
     name = Path(shell).name
+    if name in {"fish", "fish.exe"}:
+        base = home / ".config" if config_home is None else config_home
+        return base / "fish" / "config.fish"
     if name in {"zsh", "zsh.exe"}:
         return home / ".zshrc"
     if name in {"bash", "bash.exe"}:
         return home / ".bashrc"
     return home / ".profile"
+
+
+def _quote(value: str) -> str:
+    return "'" + value.replace("'", "'\\''") + "'"
 
 
 def _contains(path: str, directory: str) -> bool:

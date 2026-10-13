@@ -8,14 +8,20 @@ from pathlib import Path
 
 import pytest
 
+if sys.platform == "win32":
+    import winreg
+
+    from lama.platform import windows_env
+
 from lama.config import Settings
 from lama.errors import LamaError, OllamaUnavailable
 from lama.ollama.runner import OllamaRunner
-from lama.platform.darwin import parse_kern_procargs2, read_darwin_process
+from lama.platform.darwin import classify_proc_pidinfo, parse_kern_procargs2, read_darwin_process
 from lama.platform.host import spawn_options, uses_native_process_table
-from lama.platform.install import installer_for, run_installer
+from lama.platform.install import installer_environment, installer_for, run_installer
 from lama.platform.locate import BinaryLocation, candidate_paths, locate
 from lama.platform.pathfix import append_export, merge_path, profile_file, shell_export
+from lama.platform.unix_env import persist_user_path
 
 
 def test_windows_candidates_use_localappdata() -> None:
@@ -100,6 +106,8 @@ def test_profile_file_follows_the_shell_name() -> None:
     assert profile_file(home, "/bin/zsh") == home / ".zshrc"
     assert profile_file(home, "bash") == home / ".bashrc"
     assert profile_file(home, "/bin/sh") == home / ".profile"
+    assert profile_file(home, "/usr/bin/fish") == home / ".config" / "fish" / "config.fish"
+    assert profile_file(home, "fish", config_home=Path("/tmp/cfg")) == Path("/tmp/cfg/fish/config.fish")
 
 
 def test_installer_urls_and_commands_are_fixed() -> None:
@@ -107,7 +115,14 @@ def test_installer_urls_and_commands_are_fixed() -> None:
     linux = installer_for("linux")
     darwin = installer_for("darwin")
     assert windows.url == "https://ollama.com/install.ps1"
-    assert windows.argv(Path("install.ps1")) == ["powershell", "-NoProfile", "-File", "install.ps1"]
+    assert windows.argv(Path("install.ps1")) == [
+        "powershell",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "install.ps1",
+    ]
     assert linux.url == darwin.url == "https://ollama.com/install.sh"
     assert linux.argv(Path("install.sh")) == ["sh", "install.sh"]
     assert darwin.argv(Path("install.sh")) == ["sh", "install.sh"]
@@ -185,6 +200,88 @@ def test_runner_keeps_an_injected_binary(monkeypatch: pytest.MonkeyPatch) -> Non
         binary="/usr/bin/ollama",
     )
     assert runner.binary() == "/usr/bin/ollama"
+
+
+def test_installer_environment_drops_script_overrides() -> None:
+    cleaned = installer_environment(
+        {
+            "PATH": "/usr/bin",
+            "OLLAMA_HOST": "127.0.0.1:11434",
+            "OLLAMA_UNINSTALL": "1",
+            "OLLAMA_DOWNLOAD_URL": "http://example.invalid",
+            "OLLAMA_INSTALL_DIR": "/tmp/elsewhere",
+        }
+    )
+    assert cleaned == {"PATH": "/usr/bin", "OLLAMA_HOST": "127.0.0.1:11434"}
+
+
+def test_fish_profile_line_is_not_a_posix_export() -> None:
+    updated = append_export("", "/opt/ollama", shell="/usr/bin/fish")
+    assert updated == "fish_add_path --prepend --global '/opt/ollama'\n"
+
+
+def test_profile_write_keeps_existing_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PATH", "/usr/bin")
+    home = tmp_path / "home"
+    profile = home / ".bashrc"
+    profile.parent.mkdir()
+    profile.write_text("alias ll='ls'\n", encoding="utf-8")
+    directory = Path("/opt/ollama")
+    changed = persist_user_path(directory, home=home, shell="/bin/bash")
+    assert changed is True
+    text = profile.read_text(encoding="utf-8")
+    assert text.startswith("alias ll='ls'\n")
+    assert f"export PATH='{directory}':\"$PATH\"" in text
+    assert persist_user_path(directory, home=home, shell="/bin/bash") is False
+    assert list(home.glob(".bashrc.tmp")) == []
+    assert list(home.glob(".*.tmp")) == []
+
+
+def test_profile_rejects_undecodable_text(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    profile = home / ".bashrc"
+    profile.parent.mkdir()
+    original = b"\xff\xfe not utf-8"
+    profile.write_bytes(original)
+    with pytest.raises(LamaError, match="shell profile"):
+        persist_user_path(Path("/opt/ollama"), home=home, shell="/bin/bash")
+    assert profile.read_bytes() == original
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="нужен реестр Windows")
+def test_registry_read_failure_does_not_write_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail() -> str:
+        raise LamaError("read failed")
+
+    def forbidden(_value: str) -> None:
+        raise AssertionError("PATH was written")
+
+    monkeypatch.setattr(windows_env, "_read", fail)
+    monkeypatch.setattr(windows_env, "_write", forbidden)
+    with pytest.raises(LamaError, match="read failed"):
+        windows_env.persist_user_path(Path("C:/Ollama"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="нужен реестр Windows")
+def test_registry_path_must_be_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Key:
+        def __enter__(self) -> _Key:
+            return self
+
+        def __exit__(self, *_args: object) -> bool:
+            return False
+
+    monkeypatch.setattr(windows_env.winreg, "OpenKey", lambda *_args, **_kwargs: _Key())
+    monkeypatch.setattr(windows_env.winreg, "QueryValueEx", lambda _key, _name: (1, winreg.REG_DWORD))
+    with pytest.raises(LamaError, match="not text"):
+        windows_env._read()
+
+
+def test_proc_pidinfo_requires_the_full_bsdinfo_buffer() -> None:
+    assert classify_proc_pidinfo(136, 136, 0) == "ok"
+    assert classify_proc_pidinfo(16, 136, 0) == "unreadable"
+    assert classify_proc_pidinfo(0, 136, 3) == "gone"
+    assert classify_proc_pidinfo(-1, 136, 0) == "unreadable"
 
 
 def test_runner_reports_a_missing_binary(monkeypatch: pytest.MonkeyPatch) -> None:
