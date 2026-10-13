@@ -49,6 +49,25 @@ uv run lama --help
 
 The interface is English by default. The Language menu item saves the choice in `~/.config/lama/config.toml`, and the next menu opens in Russian or English immediately. `LAMA_LANG=ru` or `LAMA_LANG=en` overrides the saved language for one launch and does not change the file.
 
+## HOW TO USE
+
+Open the menu and leave it open:
+
+```bash
+lama
+```
+
+↑↓ moves the selection, Enter confirms it, Esc goes back one step. In a model list, type part of the name to filter. The header shows whether Ollama is responding and how many models are installed. If Ollama is stopped, the menu still opens, but models and server control are unavailable.
+
+A usual session:
+
+1. Download a model: `lama pull qwen3.5:9b`.
+2. Chat with it: `lama run qwen3.5:9b`. This opens the regular Ollama chat. `lama run` without a name first asks which model to use and how to start it: a chat, a load into memory without a chat, or custom settings.
+3. Free memory when the chat is done: `lama stop`. This unloads the model. It does not stop the Ollama server.
+4. Watch the machine: `lama monitor`. Choose a live view or a one-time snapshot. The live view refreshes CPU, RAM, GPU, and loaded models every 2 seconds. Quit with `q` or Esc.
+
+The same steps are items in the `lama` menu. A direct command runs one step and exits. `lama` with no command stays in the menu until you choose Exit.
+
 ## Menu
 
 ```bash
