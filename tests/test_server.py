@@ -2,6 +2,7 @@ import json
 import shutil
 import signal
 import socket
+import sys
 from io import StringIO
 from pathlib import Path
 
@@ -16,8 +17,10 @@ from lama.server.manager import (
     ControlMode,
     EndpointScope,
     ProcessIdentity,
+    ProcessProbe,
     ServerManager,
     ServerStatus,
+    _is_serve_command,
     classify_endpoint,
     dump_process_state,
     is_owned_serve,
@@ -26,6 +29,7 @@ from lama.server.manager import (
 from lama.services import stop_model
 from lama.ui import display
 
+_FORCE_STOP = getattr(signal, "SIGKILL", 9)
 SHOW_SYSTEM = ("systemctl", "show", "ollama.service", "-p", "LoadState", "-p", "ActiveState", "--no-pager")
 SHOW_USER = ("systemctl", "--user", "show", "ollama.service", "-p", "LoadState", "-p", "ActiveState", "--no-pager")
 LOCAL_HOST = "http://127.0.0.1:11434"
@@ -112,7 +116,10 @@ def _install_proc(
     link = proc / "exe"
     if link.is_symlink() or link.exists():
         link.unlink()
-    link.symlink_to(program)
+    try:
+        link.symlink_to(program)
+    except OSError:
+        link.write_text(program, encoding="utf-8")
     return proc
 
 
@@ -126,6 +133,7 @@ def _manager(
     popen=None,
     sleeper=None,
     executor=None,
+    prober=None,
 ) -> tuple[ServerManager, list[tuple[str, ...]], list[tuple[int, int]]]:
     calls: list[tuple[str, ...]] = []
     killed: list[tuple[int, int]] = []
@@ -153,6 +161,7 @@ def _manager(
         killer=killer or default_killer,
         pid_path=tmp_path / "ollama.pid",
         log_path=tmp_path / "ollama.log",
+        prober=prober,
     )
     return manager, calls, killed
 
@@ -675,7 +684,7 @@ def test_sigkill_is_sent_only_while_identity_matches_and_file_stays_if_process_s
     manager, _calls, killed = _manager(tmp_path, FakeClient(up=True), _none())
     with pytest.raises(LamaError, match="kept"):
         manager.stop()
-    assert killed == [(identity.pid, signal.SIGTERM), (identity.pid, signal.SIGKILL)]
+    assert killed == [(identity.pid, signal.SIGTERM), (identity.pid, _FORCE_STOP)]
     assert (tmp_path / "ollama.pid").read_text(encoding="utf-8") == original
 
 
@@ -686,13 +695,13 @@ def test_sigkill_clears_state_only_after_the_process_exits(tmp_path: Path) -> No
 
     def killer(pid: int, sig: int) -> None:
         killed.append((pid, sig))
-        if sig == signal.SIGKILL:
+        if sig == _FORCE_STOP:
             shutil.rmtree(proc)
 
     killed: list[tuple[int, int]] = []
     manager, _calls, _ignored = _manager(tmp_path, FakeClient(up=True), _none(), killer=killer)
     assert "stopped" in manager.stop()
-    assert killed == [(identity.pid, signal.SIGTERM), (identity.pid, signal.SIGKILL)]
+    assert killed == [(identity.pid, signal.SIGTERM), (identity.pid, _FORCE_STOP)]
     assert not (tmp_path / "ollama.pid").exists()
 
 
@@ -725,9 +734,11 @@ def test_managed_start_records_identity(tmp_path: Path) -> None:
     _install_proc(tmp_path / "proc", identity)
     client = FakeClient(up=False)
     popped: list[list[str]] = []
+    options: dict[str, object] = {}
 
-    def popen(argv: list[str], **_kwargs: object) -> FakePopen:
+    def popen(argv: list[str], **kwargs: object) -> FakePopen:
         popped.append(argv)
+        options.update(kwargs)
         client.up = True
         return FakePopen(identity.pid, [])
 
@@ -743,6 +754,11 @@ def test_managed_start_records_identity(tmp_path: Path) -> None:
         "endpoint": LOCAL_HOST,
     }
     assert popped == [["/usr/bin/ollama", "serve"]]
+    if sys.platform == "win32":
+        assert "start_new_session" not in options
+        assert isinstance(options.get("creationflags"), int)
+    else:
+        assert options.get("start_new_session") is True
     assert killed == []
     assert _mutations(calls) == []
 
@@ -806,3 +822,51 @@ def test_remote_status_panel_does_not_claim_a_local_backend(monkeypatch) -> None
     assert "remote.example:11434" in text
     assert "0.32.15" in text
     assert "systemd" not in text
+
+
+def test_serve_command_accepts_windows_executable() -> None:
+    assert _is_serve_command([r"C:\Program Files\Ollama\ollama.exe", "serve"])
+    assert _is_serve_command(["/usr/bin/ollama", "serve"])
+    assert not _is_serve_command([r"C:\Program Files\Ollama\ollama.exe", "run", "qwen"])
+    assert not _is_serve_command(["/usr/bin/python", "serve"])
+
+
+def test_prober_starts_and_stops_without_proc(tmp_path: Path) -> None:
+    identity = _identity(pid=77, executable=r"C:\Ollama\ollama.exe", start_time=50_000, uid=42)
+    alive = True
+
+    def prober(pid: int, endpoint: str) -> ProcessProbe:
+        if alive and pid == identity.pid and endpoint == LOCAL_HOST:
+            return ProcessProbe("ready", identity)
+        return ProcessProbe("gone")
+
+    client = FakeClient(up=False)
+
+    def popen(argv: list[str], **_kwargs: object) -> FakePopen:
+        popped.append(argv)
+        client.up = True
+        return FakePopen(identity.pid, [])
+
+    def killer(pid: int, sig: int) -> None:
+        nonlocal alive
+        killed.append((pid, sig))
+        if sig == signal.SIGTERM:
+            alive = False
+
+    popped: list[list[str]] = []
+    killed: list[tuple[int, int]] = []
+    manager, calls, _ignored = _manager(
+        tmp_path,
+        client,
+        _none(),
+        popen=popen,
+        killer=killer,
+        prober=prober,
+    )
+    assert "ollama serve" in manager.start()
+    assert manager.status().mode is ControlMode.MANAGED
+    assert manager.status().can_stop is True
+    assert "stopped" in manager.stop()
+    assert killed == [(77, signal.SIGTERM)]
+    assert not (tmp_path / "ollama.pid").exists()
+    assert _mutations(calls) == []

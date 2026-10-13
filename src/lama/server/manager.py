@@ -38,6 +38,14 @@ user-служба выбирается вместо неактивной system-
 недостаточно: другое время старта, другая программа или другой владелец
 запрещают сигнал. Старый файл только с PID и повреждённая запись не дают
 права завершать процесс.
+
+Windows
+-------
+systemd и ``/proc`` здесь нет. Локальный адрес по-прежнему проверяется через
+API. Если API молчит, lama запускает ``ollama serve`` и запоминает PID, время
+создания, путь ``ollama.exe`` и владельца. Перед завершением запись сверяется
+с живым процессом. Процесс, который только отвечает по API и не записан lama,
+не останавливается.
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlparse
 
 from lama.config import Settings, state_dir
@@ -59,12 +68,29 @@ from lama.errors import LamaError, OllamaUnavailable
 from lama.i18n import t
 from lama.ollama.client import OllamaClient
 from lama.ollama.runner import OllamaRunner, build_serve_argv
+from lama.platform.darwin import read_darwin_process
+from lama.platform.host import current_kind, spawn_options, uses_native_process_table
+from lama.platform.model import assert_never
+from lama.server.windows import read_windows_process
 
 _STATE_VERSION = 1
 _WAIT_ATTEMPTS = 20
 _WAIT_INTERVAL = 0.25
 _IDENTITY_ATTEMPTS = 10
 _IDENTITY_INTERVAL = 0.05
+# На Windows SIGKILL нет. os.kill с любым сигналом, кроме CTRL_C_EVENT и CTRL_BREAK_EVENT,
+# вызывает TerminateProcess. CREATE_NO_WINDOW не принимает Ctrl+Break, поэтому обе остановки
+# здесь — жёсткое завершение этого PID. Дочерние процессы запрос на выход не получают.
+_FORCE_STOP = getattr(signal, "SIGKILL", 9)
+
+
+def _managed_stop_message() -> str:
+    if current_kind() == "windows":
+        return t(
+            "The ollama serve process started by lama has been stopped. "
+            "On Windows the process is terminated immediately, and its child processes are not asked to exit."
+        )
+    return t("The ollama serve process started by lama has been stopped.")
 
 
 class ControlMode(StrEnum):
@@ -158,6 +184,9 @@ EXTERNAL_STOP_REASON = (
     "The API is responding, but lama does not control this process: there is no single active systemd ollama "
     "service and no confirmed process started by this utility. Another process will not be stopped."
 )
+WINDOWS_EXTERNAL_STOP_REASON = (
+    "The API is responding, but lama did not start this Ollama process. Another process will not be stopped."
+)
 REMOTE_STOP_REASON = (
     "The selected address {host} is remote. An API check does not control the local machine: "
     "start, stop, restart, systemctl, ollama serve, and process signals are unavailable. "
@@ -202,6 +231,7 @@ class ServerManager:
         killer: Callable[[int, int], None] | None = None,
         pid_path: Path | None = None,
         log_path: Path | None = None,
+        prober: Callable[[int, str], ProcessProbe] | None = None,
     ) -> None:
         self.settings = settings
         self.client = client
@@ -211,6 +241,7 @@ class ServerManager:
         self._proc_root = proc_root
         self._sleep = sleeper
         self._kill = killer or os.kill
+        self._prober = prober
         self.pid_path = pid_path or (state_dir() / "ollama.pid")
         self.log_path = log_path or (state_dir() / "ollama.log")
 
@@ -286,6 +317,11 @@ class ServerManager:
         if current.mode is ControlMode.SYSTEMD_USER:
             return self._journal(user=True)
         if current.mode is ControlMode.EXTERNAL:
+            if uses_native_process_table(self._proc_root):
+                return t(
+                    "This API's log is unavailable: lama does not control the process and will not substitute "
+                    "its own log file."
+                )
             return t(
                 "This API's log is unavailable: lama does not control the process and will not substitute "
                 "local journalctl or ollama.log."
@@ -296,6 +332,8 @@ class ServerManager:
             except OSError as exc:
                 raise LamaError(t("Could not read the log {path}: {error}", path=self.log_path, error=exc)) from exc
             return content[-20000:] or t("The log file is empty.")
+        if uses_native_process_table(self._proc_root):
+            return t("No log is available. A log appears after lama starts ollama serve.")
         return t(
             "No log is available. A log appears when the server is started by a systemd service "
             "or by an ollama serve process that lama started."
@@ -401,7 +439,7 @@ class ServerManager:
                 api_error=None,
                 can_start=False,
                 can_stop=False,
-                stop_reason=_join(t(EXTERNAL_STOP_REASON), state_note),
+                stop_reason=_join(t(self._external_stop_reason()), state_note),
                 pid=None,
             )
         if system_installed:
@@ -520,7 +558,7 @@ class ServerManager:
         if record.kind is StateKind.READY and record.identity is not None:
             if record.identity.endpoint != self.settings.host:
                 return None
-            observation = classify_observation(record.identity, self._proc_root, endpoint=self.settings.host)
+            observation = self._observe(record.identity, endpoint=self.settings.host)
             if observation == "gone":
                 return t("The state file points at a process that has already exited. No signal is sent.")
             if observation == "unreadable":
@@ -535,13 +573,15 @@ class ServerManager:
             return None
         if identity.endpoint != self.settings.host:
             return None
-        if classify_observation(identity, self._proc_root, endpoint=self.settings.host) != "match":
+        if self._observe(identity, endpoint=self.settings.host) != "match":
             return None
         return identity
 
     def _legacy_pid_alive(self, record: StateRecord) -> bool:
         if record.kind is not StateKind.LEGACY or record.legacy_pid is None:
             return False
+        if uses_native_process_table(self._proc_root):
+            return self._probe(record.legacy_pid, endpoint=self.settings.host).status != "gone"
         try:
             return (self._proc_root / str(record.legacy_pid)).exists()
         except OSError:
@@ -551,14 +591,14 @@ class ServerManager:
         identity = record.identity
         if record.kind is not StateKind.READY or identity is None or identity.endpoint != self.settings.host:
             return False
-        observation = classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+        observation = self._observe(identity, endpoint=self.settings.host)
         return observation in {"mismatch", "unreadable"}
 
     def _confirmed_other_endpoint(self, record: StateRecord) -> ProcessIdentity | None:
         identity = record.identity
         if record.kind is not StateKind.READY or identity is None or identity.endpoint == self.settings.host:
             return None
-        if classify_observation(identity, self._proc_root, endpoint=identity.endpoint) != "match":
+        if self._observe(identity, endpoint=identity.endpoint) != "match":
             return None
         return identity
 
@@ -603,6 +643,26 @@ class ServerManager:
             return StateRecord(StateKind.CORRUPT)
         return parse_state_text(text)
 
+    def _external_stop_reason(self) -> str:
+        if uses_native_process_table(self._proc_root):
+            return WINDOWS_EXTERNAL_STOP_REASON
+        return EXTERNAL_STOP_REASON
+
+    def _probe(self, pid: int, *, endpoint: str) -> ProcessProbe:
+        if self._prober is not None:
+            return self._prober(pid, endpoint)
+        if uses_native_process_table(self._proc_root):
+            return _probe_native(pid, endpoint=endpoint)
+        return probe_process(pid, self._proc_root, endpoint=endpoint)
+
+    def _observe(self, identity: ProcessIdentity, *, endpoint: str) -> str:
+        return _compare_probe(identity, self._probe(identity.pid, endpoint=endpoint), endpoint=endpoint)
+
+    def _record_observation(self, record: StateRecord) -> str:
+        if record.kind is not StateKind.READY or record.identity is None:
+            return "mismatch"
+        return self._observe(record.identity, endpoint=self.settings.host)
+
     def _start_managed(self) -> None:
         try:
             self.pid_path.parent.mkdir(parents=True, exist_ok=True)
@@ -624,8 +684,8 @@ class ServerManager:
                 stdout=log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,
                 env=self.runner.environment(),
+                **spawn_options(),
             )
         finally:
             log_handle.close()
@@ -634,7 +694,7 @@ class ServerManager:
             _terminate_untracked(process)
             raise LamaError(
                 t(
-                    "Could not confirm the identity of process {pid} through /proc. "
+                    "Could not confirm the identity of process {pid}. "
                     "The process was stopped and was not recorded as permission to stop it.",
                     pid=process.pid,
                 )
@@ -653,7 +713,7 @@ class ServerManager:
         for attempt in range(_IDENTITY_ATTEMPTS):
             if attempt:
                 self._sleep(_IDENTITY_INTERVAL)
-            probe = probe_process(pid, self._proc_root, endpoint=self.settings.host)
+            probe = self._probe(pid, endpoint=self.settings.host)
             if probe.status == "ready" and probe.identity is not None:
                 return probe.identity
         return None
@@ -662,7 +722,7 @@ class ServerManager:
         record = self._load_state()
         identity = self._matching_identity(record)
         if identity is None:
-            observation = _observation_for_record(record, self._proc_root, endpoint=self.settings.host)
+            observation = self._record_observation(record)
             if observation == "gone" and record.kind is StateKind.READY:
                 self._clear_state(record.identity)
                 return t("The process from the state file has already exited. No signal was sent.")
@@ -674,17 +734,17 @@ class ServerManager:
         outcome = self._wait_until_changed(identity)
         if outcome == "gone":
             self._clear_state(identity)
-            return t("The ollama serve process started by lama has been stopped.")
+            return _managed_stop_message()
         if outcome == "unreadable":
-            raise LamaError(t("Could not read /proc again. SIGKILL was not sent, and the state file was kept."))
+            raise LamaError(t("Could not read the process again. SIGKILL was not sent, and the state file was kept."))
         if outcome == "mismatch":
             self._clear_state(identity)
             raise LamaError(t("Process identity changed. Another process was not stopped with SIGKILL."))
-        self._signal_if_match(identity, signal.SIGKILL)
+        self._signal_if_match(identity, _FORCE_STOP)
         outcome = self._wait_until_changed(identity)
         if outcome == "gone":
             self._clear_state(identity)
-            return t("The ollama serve process started by lama has been stopped.")
+            return _managed_stop_message()
         if outcome == "mismatch":
             self._clear_state(identity)
             raise LamaError(t("After SIGKILL the PID already belongs to another process. No further signal was sent."))
@@ -693,7 +753,7 @@ class ServerManager:
         )
 
     def _signal_if_match(self, identity: ProcessIdentity, sig: int) -> None:
-        observation = classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+        observation = self._observe(identity, endpoint=self.settings.host)
         if observation == "gone":
             self._clear_state(identity)
             raise LamaError(t("The process from the state file has already exited. No signal was sent."))
@@ -702,7 +762,7 @@ class ServerManager:
             raise LamaError(t("Process identity changed. Another process was not stopped."))
         if observation != "match":
             raise LamaError(
-                t("Could not read /proc before the signal. No signal was sent, and the state file was kept.")
+                t("Could not read the process before the signal. No signal was sent, and the state file was kept.")
             )
         record = self._load_state()
         if record.identity != identity:
@@ -711,11 +771,11 @@ class ServerManager:
 
     def _wait_until_changed(self, identity: ProcessIdentity) -> str:
         for _ in range(_WAIT_ATTEMPTS):
-            observation = classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+            observation = self._observe(identity, endpoint=self.settings.host)
             if observation != "match":
                 return observation
             self._sleep(_WAIT_INTERVAL)
-        return classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+        return self._observe(identity, endpoint=self.settings.host)
 
     def _clear_state(self, identity: ProcessIdentity | None) -> None:
         if identity is None:
@@ -852,7 +912,7 @@ def probe_process(pid: int, proc_root: Path, *, endpoint: str) -> ProcessProbe:
     try:
         command = read_cmdline(pid, proc_root)
         stat_text = (directory / "stat").read_text(encoding="utf-8", errors="replace")
-        executable = os.readlink(directory / "exe")
+        executable = _read_executable(directory / "exe")
         uid = _read_uid(directory / "status")
     except OSError:
         return ProcessProbe("unreadable")
@@ -873,9 +933,12 @@ def probe_process(pid: int, proc_root: Path, *, endpoint: str) -> ProcessProbe:
 
 def classify_observation(identity: ProcessIdentity, proc_root: Path, *, endpoint: str) -> str:
     """Сравнить сохранённую идентичность с /proc: match, gone, mismatch или unreadable."""
+    return _compare_probe(identity, probe_process(identity.pid, proc_root, endpoint=endpoint), endpoint=endpoint)
+
+
+def _compare_probe(identity: ProcessIdentity, probe: ProcessProbe, *, endpoint: str) -> str:
     if identity.endpoint != endpoint:
         return "mismatch"
-    probe = probe_process(identity.pid, proc_root, endpoint=endpoint)
     if probe.status in {"gone", "unreadable"}:
         return probe.status
     if probe.status != "ready" or probe.identity != identity:
@@ -923,6 +986,19 @@ def _strict_int(value: object) -> int | None:
     return value
 
 
+def _read_executable(path: Path) -> str:
+    """Путь из символической ссылки ``/proc/<pid>/exe``.
+
+    В тестах на Windows ссылку создать нельзя, поэтому допускается обычный файл с тем же путём.
+    """
+    try:
+        return os.readlink(path)
+    except OSError:
+        if not path.is_file():
+            raise
+        return path.read_text(encoding="utf-8").strip()
+
+
 def _read_uid(path: Path) -> int | None:
     text = path.read_text(encoding="utf-8", errors="replace")
     for line in text.splitlines():
@@ -941,8 +1017,52 @@ def _read_uid(path: Path) -> int | None:
     return None
 
 
+def _probe_native(pid: int, *, endpoint: str) -> ProcessProbe:
+    kind = current_kind()
+    if kind == "windows":
+        read = read_windows_process(pid)
+    elif kind == "darwin":
+        read = read_darwin_process(pid)
+    elif kind == "linux":
+        return probe_process(pid, Path("/proc"), endpoint=endpoint)
+    else:
+        assert_never(kind)
+    return _probe_from_read(read, endpoint=endpoint)
+
+
+class _ProcessRead(Protocol):
+    status: str
+    pid: int
+    start_time: int
+    executable: str
+    uid: int
+    command: tuple[str, ...]
+
+
+def _probe_from_read(read: _ProcessRead, *, endpoint: str) -> ProcessProbe:
+    if read.status != "ok":
+        return ProcessProbe(read.status)
+    if not read.executable or read.start_time <= 0 or read.uid < 0 or not read.command:
+        return ProcessProbe("unreadable")
+    identity = ProcessIdentity(
+        pid=read.pid,
+        start_time=read.start_time,
+        executable=read.executable,
+        uid=read.uid,
+        endpoint=endpoint,
+    )
+    if not _is_serve_command(list(read.command)):
+        return ProcessProbe("other", identity)
+    return ProcessProbe("ready", identity)
+
+
 def _is_serve_command(command: list[str]) -> bool:
-    return len(command) >= 2 and Path(command[0]).name == "ollama" and command[1] == "serve"
+    if len(command) < 2:
+        return False
+    name = Path(command[0]).name
+    if name.lower() == "ollama.exe":
+        return command[1].lower() == "serve"
+    return name == "ollama" and command[1] == "serve"
 
 
 def _observation_for_record(record: StateRecord, proc_root: Path, *, endpoint: str) -> str:

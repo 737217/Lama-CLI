@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,7 +13,7 @@ from rich.text import Text
 
 from lama.config import Settings, remember_keep_alive, save_settings
 from lama.context import build_client, build_runner
-from lama.errors import LamaError, UserCancelled
+from lama.errors import LamaError, OllamaUnavailable, UserCancelled
 from lama.formatting import format_bytes
 from lama.i18n import set_language, t
 from lama.monitor.resources import collect_snapshot
@@ -21,7 +21,12 @@ from lama.ollama.client import OllamaClient
 from lama.ollama.modelfile import PARAMETER_ORDER, render_modelfile
 from lama.ollama.runner import OllamaRunner
 from lama.ollama.types import InstalledModel, PullEvent, RunningModel
-from lama.server.manager import ServerManager
+from lama.platform.host import current_kind, locate_ollama
+from lama.platform.host import open_catalog as open_catalog_url
+from lama.platform.install import installer_environment, installer_for, run_installer
+from lama.platform.model import PlatformKind, assert_never
+from lama.platform.persist import publish_path
+from lama.server.manager import ControlMode, ServerManager
 from lama.services import (
     create_from_file,
     create_from_spec,
@@ -405,6 +410,8 @@ def server_menu(session: Session) -> None:
                 (t("Stop"), "stop"),
                 (t("Restart"), "restart"),
                 (t("Journal"), "logs"),
+                (t("Install Ollama"), "install"),
+                (t("Add Ollama to PATH"), "path"),
                 (t("Connection address"), "host"),
             ],
         )
@@ -412,13 +419,18 @@ def server_menu(session: Session) -> None:
             return
         try:
             if choice == "start":
-                show_success(manager.start())
+                _start_local_server(session, manager)
             elif choice == "stop":
                 show_success(manager.stop())
             elif choice == "restart":
+                _ensure_local_binary(session, manager)
                 show_success(manager.restart())
             elif choice == "logs":
                 show_text_block(t("Journal"), manager.logs())
+            elif choice == "install":
+                install_flow(session)
+            elif choice == "path":
+                path_flow(session)
             elif choice == "host":
                 connection_flow(session)
         except UserCancelled:
@@ -433,16 +445,23 @@ def server_action(session: Session, action: str) -> None:
         show_server(manager.status())
         return
     if action == "start":
-        show_success(manager.start())
+        _start_local_server(session, manager)
         return
     if action == "stop":
         show_success(manager.stop())
         return
     if action == "restart":
+        _ensure_local_binary(session, manager)
         show_success(manager.restart())
         return
     if action == "logs":
         show_text_block(t("Journal"), manager.logs())
+        return
+    if action == "install":
+        install_flow(session)
+        return
+    if action == "path":
+        path_flow(session)
         return
     raise LamaError(t("Unknown server action: {action}", action=action))
 
@@ -579,14 +598,102 @@ def resolve_running(models: list[RunningModel], name: str) -> str:
 
 def open_library() -> None:
     console.print(Text(_LIBRARY_URL))
-    if shutil.which("xdg-open") is None:
+    open_catalog_url(_LIBRARY_URL)
+
+
+def install_flow(session: Session) -> None:
+    _confirm_official_install(session)
+    _run_official_installer()
+    located = locate_ollama()
+    if located is None:
+        raise LamaError(t("Ollama is still not installed."))
+    if not located.on_path:
+        _offer_path(session, located.path)
+    show_success(t("Ollama installed: {path}", path=located.path))
+
+
+def path_flow(session: Session) -> None:
+    located = locate_ollama()
+    if located is None:
+        raise OllamaUnavailable(
+            t("The ollama command was not found. Install it from the Server menu or with lama server install.")
+        )
+    if located.on_path:
+        show_success(t("Ollama is already on PATH."))
         return
-    subprocess.run(
-        ["xdg-open", _LIBRARY_URL],
-        check=False,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    _offer_path(session, located.path)
+
+
+def _start_local_server(session: Session, manager: ServerManager) -> None:
+    _ensure_local_binary(session, manager)
+    show_success(manager.start())
+
+
+def _ensure_local_binary(session: Session, manager: ServerManager) -> None:
+    status = manager.status()
+    if status.api_up or not status.can_start or status.mode is not ControlMode.STOPPED:
+        return
+    located = locate_ollama()
+    if located is None:
+        _confirm_official_install(session)
+        _run_official_installer()
+        located = locate_ollama()
+        if located is None:
+            raise LamaError(t("Ollama is still not installed."))
+    if not located.on_path:
+        _offer_path(session, located.path)
+    session.runner.pin(str(located.path))
+
+
+def _run_official_installer() -> None:
+    with tempfile.TemporaryDirectory(prefix="lama-ollama-") as directory:
+        run_installer(current_kind(), Path(directory), execute=_installer_exit_code)
+
+
+def _confirm_official_install(session: Session) -> None:
+    kind = current_kind()
+    spec = installer_for(kind)
+    console.print(Text(spec.url))
+    _need_confirm(session.prompter.confirm(_install_prompt(kind, spec.url), default=False))
+
+
+def _install_prompt(kind: PlatformKind, url: str) -> str:
+    if kind == "linux":
+        return t(
+            "Download and run the official Ollama installer from {url}? "
+            "It may ask for sudo, install and start a systemd service, "
+            "and install the NVIDIA CUDA driver when a GPU is found.",
+            url=url,
+        )
+    if kind == "darwin":
+        return t(
+            "Download and run the official Ollama installer from {url}? "
+            "It runs pkill -x Ollama when that app is running and deletes "
+            "/Applications/Ollama.app when the app is already installed.",
+            url=url,
+        )
+    if kind == "windows":
+        return t("Download and run the official Ollama installer from {url}?", url=url)
+    return assert_never(kind)
+
+
+def _installer_exit_code(argv: list[str]) -> int:
+    completed = subprocess.run(argv, check=False, env=installer_environment(os.environ))
+    return completed.returncode
+
+
+def _offer_path(session: Session, binary: Path) -> bool:
+    answer = session.prompter.confirm(
+        t("Ollama was found at {path}, but it is not on PATH. Add that directory?", path=binary),
+        default=True,
     )
+    if answer is None:
+        raise UserCancelled()
+    if not answer:
+        return False
+    publish_path(binary.parent)
+    show_success(t("Added {directory} to PATH.", directory=binary.parent))
+    return True
 
 
 def _start_chat(session: Session, model: str, *, keepalive: str | None) -> None:

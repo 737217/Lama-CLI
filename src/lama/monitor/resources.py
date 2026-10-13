@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from pathlib import Path
 
 from lama.errors import LamaError
 from lama.i18n import t
+from lama.monitor.windows_metrics import read_windows_cpu, read_windows_memory
 from lama.ollama.client import OllamaClient
 from lama.ollama.types import RunningModel
 
@@ -203,6 +205,14 @@ def read_cpu(
     )
 
 
+_LINUX_MEMINFO = Path("/proc/meminfo")
+_LINUX_STAT = Path("/proc/stat")
+
+
+def _windows_counters(meminfo_path: Path, stat_path: Path) -> bool:
+    return sys.platform == "win32" and meminfo_path == _LINUX_MEMINFO and stat_path == _LINUX_STAT
+
+
 def collect_snapshot(
     client: OllamaClient,
     *,
@@ -214,16 +224,19 @@ def collect_snapshot(
     nvidia: Callable[[], tuple[list[GpuInfo], str | None]] | None = None,
 ) -> Snapshot:
     snapshot = Snapshot()
-    if settle_seconds > 0 and previous_cpu is None:
-        _, baseline, _ = read_cpu(stat_path, loadavg_path)
-        if baseline is not None:
-            time.sleep(settle_seconds)
-            previous_cpu = baseline
-    snapshot.cpu, snapshot.cpu_times, snapshot.cpu_note = read_cpu(stat_path, loadavg_path, previous_cpu)
-    try:
-        snapshot.memory = parse_meminfo(meminfo_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        snapshot.memory_note = t("Memory is unavailable: {error}", error=exc)
+    if _windows_counters(meminfo_path, stat_path):
+        _fill_windows_host(snapshot, previous_cpu=previous_cpu, settle_seconds=settle_seconds)
+    else:
+        if settle_seconds > 0 and previous_cpu is None:
+            _, baseline, _ = read_cpu(stat_path, loadavg_path)
+            if baseline is not None:
+                time.sleep(settle_seconds)
+                previous_cpu = baseline
+        snapshot.cpu, snapshot.cpu_times, snapshot.cpu_note = read_cpu(stat_path, loadavg_path, previous_cpu)
+        try:
+            snapshot.memory = parse_meminfo(meminfo_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            snapshot.memory_note = t("Memory is unavailable: {error}", error=exc)
     gpu_query = nvidia or query_nvidia
     snapshot.gpus, snapshot.gpu_note = gpu_query()
     try:
@@ -231,3 +244,25 @@ def collect_snapshot(
     except LamaError as exc:
         snapshot.running_note = str(exc)
     return snapshot
+
+
+def _fill_windows_host(snapshot: Snapshot, *, previous_cpu: CpuTimes | None, settle_seconds: float) -> None:
+    if settle_seconds > 0 and previous_cpu is None:
+        baseline = read_windows_cpu()
+        if baseline is not None:
+            time.sleep(settle_seconds)
+            previous_cpu = CpuTimes(busy=baseline[0], total=baseline[1])
+    current = read_windows_cpu()
+    if current is None:
+        snapshot.cpu_note = t("CPU load is unavailable: {detail}", detail=t("Windows CPU counters did not respond."))
+    else:
+        times = CpuTimes(busy=current[0], total=current[1])
+        percent = cpu_percent(previous_cpu, times) if previous_cpu is not None else None
+        snapshot.cpu = CpuInfo(percent=percent, load_1=None, load_5=None, load_15=None)
+        snapshot.cpu_times = times
+    try:
+        total, available = read_windows_memory()
+    except OSError as exc:
+        snapshot.memory_note = t("Memory is unavailable: {error}", error=exc)
+        return
+    snapshot.memory = MemoryInfo(total=total, available=available, used=max(total - available, 0))
