@@ -24,6 +24,7 @@ from lama.ui.actions import (
     show_flow,
     stop_flow,
     system_info,
+    try_start_server,
 )
 from lama.ui.display import console, show_error, show_header
 from lama.ui.prompts import QuestionaryPrompter
@@ -52,6 +53,7 @@ def main_menu() -> list[tuple[str, str]]:
 def run_main_menu(settings: Settings, prompter: QuestionaryPrompter | None = None) -> None:
     session = open_session(settings, prompter=prompter)
     try:
+        try_start_server(session)
         while True:
             _print_status(session.client)
             choice = session.prompter.select(t("Action"), main_menu())

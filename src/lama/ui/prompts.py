@@ -66,17 +66,17 @@ class QuestionaryPrompter:
         return str(result)
 
     def confirm(self, message: str, *, default: bool = False) -> bool | None:
-        question = questionary.confirm(
-            message,
-            default=default,
-            qmark="❯",
-            style=_STYLE,
-            instruction=t("Esc — back"),
-        )
-        result = _ask(question)
-        if result is None:
+        """Да или нет тем же списком, что и меню: стрелки, Enter и Esc.
+
+        questionary.confirm ждёт клавиши y/n и по Enter берёт значение по умолчанию.
+        Для удаления это «нет», поэтому Enter молча отменял операцию.
+        """
+        yes = (t("Yes"), "yes")
+        no = (t("No"), "no")
+        picked = self.select(message, [yes, no] if default else [no, yes])
+        if picked is None:
             return None
-        return bool(result)
+        return picked == "yes"
 
     def path(self, message: str) -> str | None:
         question = questionary.path(message, qmark="❯", style=_STYLE)

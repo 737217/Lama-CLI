@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from lama.cli import app, typer_app
 from lama.errors import LamaError, OllamaUnavailable
+from lama.ollama.discover import OllamaInstall
 from lama.server.manager import ControlMode, ServerStatus
 
 runner = CliRunner()
@@ -64,11 +65,166 @@ def test_list_when_server_is_down(monkeypatch) -> None:
         def close(self) -> None:
             return None
 
+    class Manager:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+        def status(self) -> ServerStatus:
+            return ServerStatus(
+                api_up=False,
+                version=None,
+                host="http://127.0.0.1:11434",
+                mode=ControlMode.REMOTE,
+                can_start=False,
+                can_stop=False,
+                stop_reason="remote",
+                pid=None,
+            )
+
+    monkeypatch.setattr("lama.ui.actions.ServerManager", Manager)
     monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: Client())
     monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: object())
     result = runner.invoke(typer_app, ["list"])
     assert result.exit_code == 1
     assert "unreachable" in result.stdout
+
+
+class _DownClient:
+    def __init__(self) -> None:
+        self.up = False
+
+    def version(self) -> str:
+        if not self.up:
+            raise OllamaUnavailable("Ollama is unreachable at http://127.0.0.1:11434.")
+        return "0.32.15"
+
+    def list_models(self) -> list[object]:
+        return []
+
+    def close(self) -> None:
+        return None
+
+
+class _StartManager:
+    def __init__(self, client: _DownClient, started: list[str | None]) -> None:
+        self.client = client
+        self.started = started
+
+    def status(self) -> ServerStatus:
+        return ServerStatus(
+            api_up=self.client.up,
+            version="0.32.15" if self.client.up else None,
+            host="http://127.0.0.1:11434",
+            mode=ControlMode.STOPPED,
+            can_start=not self.client.up,
+            can_stop=False,
+            stop_reason="The server is not running.",
+            pid=None,
+        )
+
+    def start(self, *, prefer_binary: str | None = None) -> str:
+        self.started.append(prefer_binary)
+        self.client.up = True
+        return "Started ollama serve."
+
+    def service_binary(self, _mode: ControlMode) -> str | None:
+        return None
+
+    def stop_other_than(self, _executable: str) -> None:
+        return None
+
+
+class _BinaryRunner:
+    def __init__(self) -> None:
+        self.path: str | None = None
+
+    def use_binary(self, path: str) -> None:
+        self.path = path
+
+
+def test_list_starts_a_stopped_local_server(monkeypatch) -> None:
+    client = _DownClient()
+    started: list[str | None] = []
+    monkeypatch.setattr("lama.ui.actions.ServerManager", lambda *_args, **_kwargs: _StartManager(client, started))
+    monkeypatch.setattr(
+        "lama.ui.actions.discover_ollama_installs",
+        lambda: [OllamaInstall("/usr/local/bin/ollama", "0.11.4")],
+    )
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: _BinaryRunner())
+    result = runner.invoke(typer_app, ["list"])
+    assert result.exit_code == 0
+    assert started == [None]
+    assert "Started ollama serve." in result.stdout
+    assert "No models are installed." in result.stdout
+
+
+def test_list_asks_which_ollama_to_start(monkeypatch, tmp_path: Path) -> None:
+    system = tmp_path / "usr" / "bin" / "ollama"
+    local = tmp_path / "usr" / "local" / "bin" / "ollama"
+    system.parent.mkdir(parents=True)
+    local.parent.mkdir(parents=True)
+    system.write_text("system", encoding="utf-8")
+    local.write_text("local", encoding="utf-8")
+    client = _DownClient()
+    started: list[str | None] = []
+    seen: list[str] = []
+
+    class Prompter:
+        def select(self, message: str, choices: list[tuple[str, str]], search: bool = False) -> str:
+            assert message == "Which Ollama should be started?"
+            seen.extend(title for title, _value in choices)
+            return str(local)
+
+    monkeypatch.setattr("lama.ui.actions._prompt_available", lambda: True)
+    monkeypatch.setattr("lama.ui.actions.prompts.prompter", Prompter())
+    monkeypatch.setattr(
+        "lama.ui.actions.discover_ollama_installs",
+        lambda: [
+            OllamaInstall(str(system), "0.6.2", "0.0.0.0:11434"),
+            OllamaInstall(str(local), "0.11.4", "127.0.0.1:11435"),
+        ],
+    )
+    monkeypatch.setattr("lama.ui.actions.save_settings", lambda _settings: None)
+    monkeypatch.setattr("lama.ui.actions.running_serve_executables", lambda _root: [])
+
+    class Manager(_StartManager):
+        def service_binary(self, _mode: ControlMode) -> str | None:
+            return os.path.realpath(system)
+
+    monkeypatch.setattr("lama.ui.actions.ServerManager", lambda *_args, **_kwargs: Manager(client, started))
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    binary = _BinaryRunner()
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: binary)
+    result = runner.invoke(typer_app, ["list"])
+    assert result.exit_code == 0
+    assert started == [str(local)]
+    assert binary.path == str(local)
+    assert any("0.6.2" in title and "0.0.0.0:11434" in title for title in seen)
+    assert any("0.11.4" in title and "127.0.0.1:11435" in title for title in seen)
+
+
+def test_list_without_a_terminal_does_not_guess_among_versions(monkeypatch, tmp_path: Path) -> None:
+    first = tmp_path / "a" / "ollama"
+    second = tmp_path / "b" / "ollama"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("a", encoding="utf-8")
+    second.write_text("b", encoding="utf-8")
+    client = _DownClient()
+    started: list[str | None] = []
+    monkeypatch.setattr("lama.ui.actions._prompt_available", lambda: False)
+    monkeypatch.setattr("lama.ui.actions.ServerManager", lambda *_args, **_kwargs: _StartManager(client, started))
+    monkeypatch.setattr(
+        "lama.ui.actions.discover_ollama_installs",
+        lambda: [OllamaInstall(str(first), "0.6.2"), OllamaInstall(str(second), "0.11.4")],
+    )
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: _BinaryRunner())
+    result = runner.invoke(typer_app, ["list"])
+    assert result.exit_code == 1
+    assert "Several Ollama versions" in result.stdout
+    assert started == []
 
 
 def test_server_status(monkeypatch) -> None:

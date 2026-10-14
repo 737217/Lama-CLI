@@ -20,7 +20,11 @@ from lama.server.manager import (
     ServerStatus,
     classify_endpoint,
     dump_process_state,
+    endpoint_served_by,
     is_owned_serve,
+    parse_environment_value,
+    parse_execstart_path,
+    parse_listening_inodes,
     parse_stat_start_time,
 )
 from lama.services import stop_model
@@ -28,6 +32,7 @@ from lama.ui import display
 
 SHOW_SYSTEM = ("systemctl", "show", "ollama.service", "-p", "LoadState", "-p", "ActiveState", "--no-pager")
 SHOW_USER = ("systemctl", "--user", "show", "ollama.service", "-p", "LoadState", "-p", "ActiveState", "--no-pager")
+SHOW_EXEC = ("systemctl", "show", "ollama.service", "-p", "ExecStart", "--no-pager")
 LOCAL_HOST = "http://127.0.0.1:11434"
 
 
@@ -806,3 +811,172 @@ def test_remote_status_panel_does_not_claim_a_local_backend(monkeypatch) -> None
     assert "remote.example:11434" in text
     assert "0.32.15" in text
     assert "systemd" not in text
+
+
+def test_parse_execstart_path_reads_the_program() -> None:
+    text = "ExecStart={ path=/usr/local/bin/ollama ; argv[]=/usr/local/bin/ollama serve ; }\n"
+    assert parse_execstart_path(text) == "/usr/local/bin/ollama"
+    assert parse_execstart_path("ExecStart=\n") is None
+    assert parse_execstart_path("") is None
+
+
+def test_chosen_binary_matching_unit_starts_systemd(tmp_path: Path) -> None:
+    client = FakeClient(up=False)
+    calls: list[tuple[str, ...]] = []
+
+    def executor(argv: list[str]) -> CommandCapture:
+        calls.append(tuple(argv))
+        if tuple(argv) == SHOW_SYSTEM:
+            return _unit(True, False)
+        if tuple(argv) == SHOW_USER:
+            return _unit(False)
+        if tuple(argv) == SHOW_EXEC:
+            return CommandCapture(
+                0,
+                "ExecStart={ path=/var/tmp/lama-test-ollama/same ; argv[]=/var/tmp/lama-test-ollama/same serve ; }\n",
+                "",
+            )
+        if argv[:3] == ["systemctl", "start", "ollama.service"]:
+            client.up = True
+            return CommandCapture(0, "", "")
+        return CommandCapture(1, "", "not found")
+
+    popped: list[list[str]] = []
+    manager, _calls, killed = _manager(
+        tmp_path,
+        client,
+        executor=executor,
+        popen=lambda argv, **_kwargs: popped.append(argv),
+    )
+    assert "systemd" in manager.start(prefer_binary="/var/tmp/lama-test-ollama/same")
+    assert ("systemctl", "start", "ollama.service") in calls
+    assert popped == []
+    assert killed == []
+
+
+def test_chosen_binary_different_from_unit_starts_that_file(tmp_path: Path) -> None:
+    chosen = "/var/tmp/lama-test-other/ollama"
+    identity = _identity(pid=77, executable=chosen)
+    _install_proc(tmp_path / "proc", identity, executable=chosen)
+    client = FakeClient(up=False)
+    calls: list[tuple[str, ...]] = []
+    popped: list[list[str]] = []
+
+    def executor(argv: list[str]) -> CommandCapture:
+        calls.append(tuple(argv))
+        if tuple(argv) == SHOW_SYSTEM:
+            return _unit(True, False)
+        if tuple(argv) == SHOW_USER:
+            return _unit(False)
+        if tuple(argv) == SHOW_EXEC:
+            return CommandCapture(
+                0,
+                "ExecStart={ path=/var/tmp/lama-test-unit/ollama ; argv[]=/var/tmp/lama-test-unit/ollama serve ; }\n",
+                "",
+            )
+        return CommandCapture(1, "", "not found")
+
+    def popen(argv: list[str], **_kwargs: object) -> FakePopen:
+        popped.append(argv)
+        client.up = True
+        return FakePopen(identity.pid, [])
+
+    manager, _calls, killed = _manager(tmp_path, client, executor=executor, popen=popen)
+    assert "ollama serve" in manager.start(prefer_binary=chosen)
+    assert popped == [[chosen, "serve"]]
+    assert ("systemctl", "start", "ollama.service") not in calls
+    assert killed == []
+
+
+def _listen(proc_root: Path, identity: ProcessIdentity, *, port: int, inode: int = 4242) -> None:
+    _install_proc(proc_root, identity)
+    net = proc_root / "net"
+    net.mkdir(parents=True, exist_ok=True)
+    line = (
+        f"   0: 0100007F:{port:04X} 00000000:0000 0A 00000000:00000000 "
+        f"00:00000000 00000000 1000 0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+    )
+    (net / "tcp").write_text("  sl  local_address rem_address   st tx_queue rx_queue\n" + line, encoding="utf-8")
+    fd_dir = proc_root / str(identity.pid) / "fd"
+    fd_dir.mkdir(parents=True, exist_ok=True)
+    (fd_dir / "3").symlink_to(f"socket:[{inode}]")
+
+
+def test_parse_environment_and_listening_socket() -> None:
+    text = "Environment=PATH=/usr/bin OLLAMA_HOST=0.0.0.0:11434 OLLAMA_CONTEXT_LENGTH=65536\n"
+    assert parse_environment_value(text, "OLLAMA_HOST") == "0.0.0.0:11434"
+    assert endpoint_served_by("0.0.0.0:11434", "http://127.0.0.1:11434") is True
+    assert endpoint_served_by("0.0.0.0:11434", "http://127.0.0.1:11435") is False
+    assert endpoint_served_by("127.0.0.1:11434", "http://localhost:11434") is True
+    inodes = parse_listening_inodes(
+        "   0: 0100007F:2CAA 00000000:0000 0A 00000000:00000000 00:00000000 00000000 1000 0 4242 1 x\n",
+        port=11434,
+        addresses={"127.0.0.1"},
+    )
+    assert inodes == {4242}
+
+
+def test_listener_on_the_selected_port_can_be_stopped(tmp_path: Path) -> None:
+    identity = _identity(pid=77)
+    proc_root = tmp_path / "proc"
+    _listen(proc_root, identity, port=11434)
+    removed: list[int] = []
+
+    def killer(pid: int, sig: int) -> None:
+        removed.append(sig)
+        if sig == signal.SIGTERM:
+            shutil.rmtree(proc_root / str(pid))
+
+    manager, calls, killed = _manager(tmp_path, FakeClient(up=True), _none(), killer=killer)
+    status = manager.status()
+    assert status.mode is ControlMode.LISTENER
+    assert status.can_stop is True
+    assert status.can_start is False
+    assert status.pid == 77
+    assert "stopped" in manager.stop()
+    assert removed == [signal.SIGTERM]
+    assert killed == []
+    assert _mutations(calls) == []
+
+
+def test_unit_on_another_port_starts_serve_on_the_selected_address(tmp_path: Path) -> None:
+    settings = _settings("http://127.0.0.1:11435", "127.0.0.1:11435")
+    identity = _identity(pid=77)
+    _install_proc(tmp_path / "proc", identity)
+    client = FakeClient(up=False)
+    calls: list[tuple[str, ...]] = []
+    popped: list[list[str]] = []
+    hosts: list[str | None] = []
+
+    def executor(argv: list[str]) -> CommandCapture:
+        calls.append(tuple(argv))
+        if tuple(argv) == SHOW_SYSTEM:
+            return _unit(True, False)
+        if tuple(argv) == SHOW_USER:
+            return _unit(False)
+        if tuple(argv) == ("systemctl", "show", "ollama.service", "-p", "Environment", "--no-pager"):
+            return CommandCapture(0, "Environment=OLLAMA_HOST=0.0.0.0:11434\n", "")
+        return CommandCapture(1, "", "not found")
+
+    def popen(argv: list[str], **kwargs: object) -> FakePopen:
+        popped.append(argv)
+        env = kwargs.get("env")
+        hosts.append(env.get("OLLAMA_HOST") if isinstance(env, dict) else None)
+        client.up = True
+        return FakePopen(identity.pid, [])
+
+    manager, _calls, killed = _manager(
+        tmp_path,
+        client,
+        executor=executor,
+        settings=settings,
+        popen=popen,
+    )
+    status = manager.status()
+    assert status.mode is ControlMode.STOPPED
+    assert status.can_start is True
+    assert "ollama serve" in manager.start()
+    assert popped == [["/usr/bin/ollama", "serve"]]
+    assert hosts == ["127.0.0.1:11435"]
+    assert ("systemctl", "start", "ollama.service") not in calls
+    assert killed == []

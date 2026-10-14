@@ -15,6 +15,8 @@ class InstalledModel:
     family: str = ""
     parameter_size: str = ""
     quantization: str = ""
+    parameters: dict[str, str] = field(default_factory=dict)
+    max_context: int | None = None
 
 
 @dataclass(frozen=True)

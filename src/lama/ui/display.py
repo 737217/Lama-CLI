@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 
 from rich import box
+from rich.cells import cell_len
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
 from rich.panel import Panel
 from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
-from lama.formatting import format_bytes, format_expiry, format_modified, format_percent
+from lama.formatting import (
+    format_bytes,
+    format_context,
+    format_expiry,
+    format_modified,
+    format_options,
+    format_percent,
+    format_temperature,
+)
 from lama.i18n import t
 from lama.monitor.resources import CpuInfo, GpuInfo, MemoryInfo, Snapshot
 from lama.ollama.types import InstalledModel, ModelShow, RunningModel
@@ -23,11 +33,13 @@ _BAR_WIDTH = 20
 _SLOT_WIDTH = 6
 _TRACK = Style(bgcolor="grey42")
 
+
 def _mode_label(mode: ControlMode) -> str:
     labels = {
         ControlMode.SYSTEMD_SYSTEM: "systemd (system)",
         ControlMode.SYSTEMD_USER: "systemd (user)",
         ControlMode.MANAGED: t("lama process"),
+        ControlMode.LISTENER: t("ollama serve"),
         ControlMode.EXTERNAL: t("external process"),
         ControlMode.STOPPED: t("stopped"),
         ControlMode.REMOTE: t("remote API"),
@@ -63,18 +75,225 @@ def show_header(*, api_up: bool, version: str | None, model_count: int | None) -
     console.print(Panel(body, box=box.ROUNDED, border_style="cyan", expand=False, padding=(1, 2), width=42))
 
 
-def show_models(models: list[InstalledModel]) -> None:
-    table = Table(box=box.SIMPLE, header_style="bold cyan", expand=False)
-    table.add_column(t("MODEL"))
-    table.add_column(t("SIZE"), justify="right")
-    table.add_column(t("MODIFIED"))
-    for model in models:
-        table.add_row(
-            Text(model.name),
-            Text(format_bytes(model.size)),
-            Text(format_modified(model.modified_at)),
+def _known(value: str) -> str:
+    text = value.strip()
+    if not text or text.lower() == "unknown":
+        return "—"
+    return text
+
+
+def _wrap_cell(text: str, width: int) -> str:
+    """Перенос по ширине ячейки. Разрыв предпочтителен после / : - ."""
+    if width < 1 or cell_len(text) <= width:
+        return text
+    lines: list[str] = []
+    rest = text
+    while rest:
+        if cell_len(rest) <= width:
+            lines.append(rest)
+            break
+        cut = 0
+        size = 0
+        last_break = 0
+        for index, char in enumerate(rest):
+            size += cell_len(char)
+            if size > width:
+                break
+            cut = index + 1
+            if char in "/:-":
+                last_break = cut
+        if 0 < last_break < len(rest):
+            cut = last_break
+        if cut <= 0:
+            cut = 1
+        lines.append(rest[:cut])
+        rest = rest[cut:]
+    return "\n".join(lines)
+
+
+@dataclass
+class _ModelRow:
+    name: str
+    size: str
+    params: str
+    quant: str
+    context: str
+    temp: str
+    options: tuple[str, ...]
+    modified: str
+
+    @classmethod
+    def from_model(cls, model: InstalledModel) -> _ModelRow:
+        options = format_options(model.parameters)
+        parts = tuple(part.strip() for part in options.split("·") if part.strip() and part.strip() != "—")
+        return cls(
+            name=model.name,
+            size=format_bytes(model.size),
+            params=_known(model.parameter_size),
+            quant=_known(model.quantization),
+            context=format_context(model.parameters, model.max_context),
+            temp=format_temperature(model.parameters),
+            options=parts,
+            modified=format_modified(model.modified_at),
         )
-    console.print(table)
+
+
+@dataclass
+class _Column:
+    key: str
+    header: str
+    justify: str
+    flexible: bool
+    natural: int
+    width: int = 0
+
+
+def _chrome(count: int) -> int:
+    """Рамка, разделители и отступы rounded-таблицы с padding (0, 1)."""
+    return 2 + (count - 1) + count * 2
+
+
+def _natural(header: str, values: list[str]) -> int:
+    return max([cell_len(header), *(cell_len(value) for value in values), 1])
+
+
+def _column(key: str, rows: list[_ModelRow], *, flexible: bool = False, justify: str = "left") -> _Column:
+    headers = {
+        "model": t("MODEL"),
+        "size": t("SIZE"),
+        "params": t("PARAMS"),
+        "quant": t("QUANT"),
+        "context": t("CONTEXT"),
+        "temp": t("TEMP"),
+        "options": t("OPTIONS"),
+        "modified": t("MODIFIED"),
+    }
+    header = headers[key]
+    if key == "options":
+        values = [item for row in rows for item in row.options] or ["—"]
+    elif key == "model":
+        values = [row.name for row in rows]
+    else:
+        values = [getattr(row, key) for row in rows]
+    return _Column(
+        key=key,
+        header=header,
+        justify=justify,
+        flexible=flexible,
+        natural=_natural(header, [] if flexible and key == "model" else values),
+    )
+
+
+def _assign_widths(width: int, columns: list[_Column], *, force: bool = False) -> bool:
+    """Раздать ширины так, чтобы таблица не вылезла за терминал. False — колонок слишком много."""
+    for column in columns:
+        if not column.flexible:
+            column.width = column.natural
+    leftover = width - _chrome(len(columns)) - sum(column.width for column in columns if not column.flexible)
+    flexible = [column for column in columns if column.flexible]
+    if len(flexible) == 1:
+        if leftover < 18 and not force:
+            return False
+        flexible[0].width = max(leftover, 8)
+        return True
+    options = next(column for column in flexible if column.key == "options")
+    model = next(column for column in flexible if column.key == "model")
+    # Колонка опций не уже самой длинной строки, иначе слово рвётся посередине.
+    if leftover - options.natural < 22 and not force:
+        return False
+    options.width = options.natural if not force else max(8, min(options.natural, leftover // 3))
+    model.width = max(leftover - options.width, 8)
+    return True
+
+
+def _select_columns(width: int, rows: list[_ModelRow]) -> list[_Column]:
+    keys = ["model", "size", "params", "quant", "context", "temp", "options", "modified"]
+    while True:
+        columns = [
+            _column(
+                key,
+                rows,
+                flexible=key in {"model", "options"},
+                justify="right" if key in {"size", "params", "context", "temp"} else "left",
+            )
+            for key in keys
+        ]
+        if _assign_widths(width, columns):
+            return columns
+        for optional in ("options", "quant", "params"):
+            if optional in keys:
+                keys.remove(optional)
+                break
+        else:
+            _assign_widths(width, columns, force=True)
+            return columns
+
+
+def _name_cell(row: _ModelRow, width: int, present: set[str]) -> Text:
+    text = Text()
+    for index, line in enumerate(_wrap_cell(row.name, width).split("\n")):
+        if index:
+            text.append("\n")
+        text.append(line, style="bold")
+    extra: list[str] = []
+    if "params" not in present and row.params != "—":
+        extra.append(row.params)
+    if "quant" not in present and row.quant != "—":
+        extra.append(row.quant)
+    if "options" not in present:
+        extra.extend(row.options)
+    if extra:
+        for item in extra:
+            for line in _wrap_cell(item, width).split("\n"):
+                text.append("\n")
+                text.append(line, style="dim")
+    return text
+
+
+def _options_cell(row: _ModelRow, width: int) -> Text:
+    if not row.options:
+        return Text("—")
+    lines: list[str] = []
+    for item in row.options:
+        lines.extend(_wrap_cell(item, width).split("\n"))
+    return Text("\n".join(lines))
+
+
+def _models_table(rows: list[_ModelRow], width: int) -> Table:
+    columns = _select_columns(max(width, 60), rows)
+    present = {column.key for column in columns}
+    table = Table(
+        box=box.ROUNDED,
+        header_style="bold cyan",
+        expand=False,
+        show_lines=True,
+        padding=(0, 1),
+        highlight=False,
+    )
+    for column in columns:
+        table.add_column(
+            column.header,
+            justify=column.justify,
+            width=column.width,
+            no_wrap=True,
+            overflow="fold",
+            vertical="top",
+        )
+    for row in rows:
+        cells: list[Text] = []
+        for column in columns:
+            if column.key == "model":
+                cells.append(_name_cell(row, column.width, present))
+            elif column.key == "options":
+                cells.append(_options_cell(row, column.width))
+            else:
+                cells.append(Text(str(getattr(row, column.key))))
+        table.add_row(*cells)
+    return table
+
+
+def show_models(models: list[InstalledModel]) -> None:
+    console.print(_models_table([_ModelRow.from_model(model) for model in models], console.width))
     if not models:
         console.print(f"[dim]{t('No models are installed.')}[/dim]")
 

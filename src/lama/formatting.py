@@ -6,6 +6,19 @@ from datetime import UTC, datetime, timedelta
 
 from lama.i18n import t, tn
 
+_OPTION_KEYS = (
+    "top_p",
+    "top_k",
+    "min_p",
+    "repeat_penalty",
+    "presence_penalty",
+    "frequency_penalty",
+    "num_predict",
+    "num_batch",
+    "num_gpu",
+    "seed",
+)
+
 
 def format_percent(value: float | int | None) -> str:
     if value is None:
@@ -24,6 +37,26 @@ def format_bytes(size: int | None) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024
     return f"{value:.1f} TB"
+
+
+def format_context(parameters: dict[str, str], max_context: int | None) -> str:
+    """Рабочий num_ctx, если он задан. Иначе максимум архитектуры, помеченный как max."""
+    configured = parameters.get("num_ctx", "").strip()
+    if configured:
+        return configured
+    if max_context is not None:
+        return t("max {n}", n=max_context)
+    return "—"
+
+
+def format_temperature(parameters: dict[str, str]) -> str:
+    value = parameters.get("temperature", "").strip()
+    return value or "—"
+
+
+def format_options(parameters: dict[str, str]) -> str:
+    parts = [f"{name} {parameters[name].strip()}" for name in _OPTION_KEYS if parameters.get(name, "").strip()]
+    return " · ".join(parts) if parts else "—"
 
 
 def format_modified(moment: datetime | None, *, now: datetime | None = None) -> str:

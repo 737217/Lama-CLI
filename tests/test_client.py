@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from lama.errors import OllamaAPIError, OllamaUnavailable
-from lama.ollama.client import OllamaClient
+from lama.ollama.client import OllamaClient, context_length_from_info
 from lama.ollama.types import PullEvent
 
 
@@ -128,6 +128,59 @@ def test_pull_error_payload() -> None:
     client = _client(handler)
     with pytest.raises(OllamaAPIError, match="does not exist"):
         client.pull("nope:latest")
+
+
+def test_delete_accepts_null_success_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert json.loads(request.content) == {"model": "gemma4:12b"}
+        return httpx.Response(200, content=b"null")
+
+    _client(handler).delete("gemma4:12b")
+
+
+def test_list_models_with_parameters_reads_show_without_verbose() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [
+                        {
+                            "name": "qwen3.8:27b-ctx-64k",
+                            "size": 100,
+                            "details": {"parameter_size": "26.9B", "quantization_level": "IQ2_S"},
+                        },
+                        {"name": "broken:latest", "size": 10, "details": {}},
+                    ]
+                },
+            )
+        if request.url.path == "/api/show":
+            body = json.loads(request.content)
+            assert "verbose" not in body
+            if body["model"] == "broken:latest":
+                return httpx.Response(500, json={"error": "show failed"})
+            return httpx.Response(
+                200,
+                json={
+                    "parameters": "num_ctx 65536\ntemperature 0.6\ntop_p 0.9\n",
+                    "model_info": {"qwen35.context_length": 262144},
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    models = _client(handler).list_models_with_parameters()
+    assert models[0].parameters == {"num_ctx": "65536", "temperature": "0.6", "top_p": "0.9"}
+    assert models[0].max_context == 262144
+    assert models[0].parameter_size == "26.9B"
+    assert models[1].name == "broken:latest"
+    assert models[1].parameters == {}
+    assert models[1].max_context is None
+
+
+def test_context_length_from_info_uses_the_largest_architecture_value() -> None:
+    assert context_length_from_info({"qwen35.context_length": 262144, "other": 1}) == 262144
+    assert context_length_from_info({"note": "none"}) is None
 
 
 def test_unload_sends_keep_alive_zero() -> None:

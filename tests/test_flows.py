@@ -2,7 +2,9 @@ import pytest
 
 from lama.config import Settings
 from lama.errors import LamaError, OllamaCommandError, OllamaUnavailable, UserCancelled
+from lama.ollama.discover import OllamaInstall
 from lama.ollama.types import InstalledModel, ModelShow
+from lama.server.manager import ControlMode, ServerStatus
 from lama.services import stop_model
 from lama.ui.actions import Session, configure_flow, delete_flow, run_flow
 from lama.ui.app import run_main_menu
@@ -112,6 +114,32 @@ def test_declined_delete_does_not_call_api() -> None:
     assert client.deleted == []
 
 
+def test_confirmed_delete_calls_api() -> None:
+    client = Models()
+    session = Session(_settings(), Scripted([True]), client, Runner())  # type: ignore[arg-type]
+    delete_flow(session, "gemma4:12b")
+    assert client.deleted == ["gemma4:12b"]
+
+
+def test_confirmation_is_a_yes_no_menu() -> None:
+    from lama.ui.prompts import QuestionaryPrompter
+
+    prompter = QuestionaryPrompter()
+    seen: dict[str, object] = {}
+
+    def select(message: str, choices: list[tuple[str, str]], search: bool = False) -> str:
+        seen["message"] = message
+        seen["choices"] = choices
+        seen["search"] = search
+        return "yes"
+
+    prompter.select = select  # type: ignore[method-assign]
+    assert prompter.confirm("Delete gemma4:12b?", default=False) is True
+    assert seen["choices"] == [("No", "no"), ("Yes", "yes")]
+    assert prompter.confirm("Create it?", default=True) is True
+    assert seen["choices"] == [("Yes", "yes"), ("No", "no")]
+
+
 def test_declined_overwrite_does_not_create_model() -> None:
     class Client(Models):
         def show(self, model: str) -> ModelShow:
@@ -149,6 +177,108 @@ def test_stop_reports_both_failures() -> None:
 
     with pytest.raises(LamaError, match="Unload via the API"):
         stop_model(Runner(), Api(), "gemma4:12b")  # type: ignore[arg-type]
+
+
+class _Gate:
+    def __init__(self) -> None:
+        self.up = False
+
+    def version(self) -> str:
+        if not self.up:
+            raise OllamaUnavailable("Ollama is unreachable.")
+        return "0.32.15"
+
+    def list_models(self) -> list[InstalledModel]:
+        return []
+
+    def close(self) -> None:
+        return None
+
+
+class _MenuManager:
+    def __init__(self, client: _Gate, started: list[str | None], *, can_start: bool) -> None:
+        self.client = client
+        self.started = started
+        self._can_start = can_start
+
+    def status(self) -> ServerStatus:
+        return ServerStatus(
+            api_up=self.client.up,
+            version="0.32.15" if self.client.up else None,
+            host="http://127.0.0.1:11434",
+            mode=ControlMode.STOPPED if self._can_start else ControlMode.REMOTE,
+            can_start=self._can_start and not self.client.up,
+            can_stop=False,
+            stop_reason=None,
+            pid=None,
+        )
+
+    def start(self, *, prefer_binary: str | None = None) -> str:
+        self.started.append(prefer_binary)
+        self.client.up = True
+        return "Started ollama serve."
+
+    def service_binary(self, _mode: ControlMode) -> str | None:
+        return None
+
+
+class _Binary:
+    def use_binary(self, path: str) -> None:
+        return None
+
+
+def test_menu_starts_a_stopped_local_server(monkeypatch) -> None:
+    client = _Gate()
+    started: list[str | None] = []
+    monkeypatch.setattr(
+        "lama.ui.actions.ServerManager",
+        lambda *_args, **_kwargs: _MenuManager(client, started, can_start=True),
+    )
+    monkeypatch.setattr(
+        "lama.ui.actions.discover_ollama_installs",
+        lambda: [OllamaInstall("/usr/local/bin/ollama", "0.11.4")],
+    )
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: _Binary())
+    run_main_menu(_settings(), prompter=Scripted(["exit"]))  # type: ignore[arg-type]
+    assert started == [None]
+    assert client.up is True
+
+
+def test_menu_does_not_start_a_remote_server(monkeypatch) -> None:
+    client = _Gate()
+    started: list[str | None] = []
+    monkeypatch.setattr(
+        "lama.ui.actions.ServerManager",
+        lambda *_args, **_kwargs: _MenuManager(client, started, can_start=False),
+    )
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: _Binary())
+    run_main_menu(_settings(), prompter=Scripted(["exit"]))  # type: ignore[arg-type]
+    assert started == []
+    assert client.up is False
+
+
+def test_menu_leaves_the_server_stopped_when_the_choice_is_cancelled(monkeypatch) -> None:
+    client = _Gate()
+    started: list[str | None] = []
+    monkeypatch.setattr("lama.ui.actions._prompt_available", lambda: True)
+    monkeypatch.setattr(
+        "lama.ui.actions.ServerManager",
+        lambda *_args, **_kwargs: _MenuManager(client, started, can_start=True),
+    )
+    monkeypatch.setattr(
+        "lama.ui.actions.discover_ollama_installs",
+        lambda: [
+            OllamaInstall("/var/tmp/lama-test-unit/ollama", "0.6.2", "0.0.0.0:11434"),
+            OllamaInstall("/var/tmp/lama-test-other/ollama", "0.11.4", "127.0.0.1:11435"),
+        ],
+    )
+    monkeypatch.setattr("lama.ui.actions.build_client", lambda _settings: client)
+    monkeypatch.setattr("lama.ui.actions.build_runner", lambda _settings: _Binary())
+    run_main_menu(_settings(), prompter=Scripted([None, "exit"]))  # type: ignore[arg-type]
+    assert started == []
+    assert client.up is False
 
 
 def test_menu_exit_draws_header(monkeypatch) -> None:

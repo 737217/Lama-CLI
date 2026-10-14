@@ -13,11 +13,19 @@ from rich.text import Text
 
 from lama.config import Settings, remember_keep_alive, save_settings
 from lama.context import build_client, build_runner
-from lama.errors import LamaError, UserCancelled
-from lama.formatting import format_bytes
+from lama.errors import LamaError, OllamaUnavailable, UserCancelled
+from lama.formatting import format_bytes, format_context
 from lama.i18n import set_language, t
 from lama.monitor.resources import collect_snapshot
 from lama.ollama.client import OllamaClient
+from lama.ollama.discover import (
+    OllamaInstall,
+    client_base_for,
+    discover_ollama_installs,
+    remember_executable,
+    running_serve_executables,
+    server_env_for,
+)
 from lama.ollama.modelfile import PARAMETER_ORDER, render_modelfile
 from lama.ollama.runner import OllamaRunner
 from lama.ollama.types import InstalledModel, PullEvent, RunningModel
@@ -25,7 +33,6 @@ from lama.server.manager import ServerManager
 from lama.services import (
     create_from_file,
     create_from_spec,
-    ensure_server,
     pull_model,
     stop_model,
     supported_commands,
@@ -89,7 +96,7 @@ def pubkey_path() -> Path:
 
 
 def run_flow(session: Session, model: str | None = None, *, direct_chat: bool = False) -> bool:
-    ensure_server(session.client)
+    ensure_running(session)
     picked_here = model is None
     if model is None:
         model = _choose_installed(session, t("Choose a model"))
@@ -127,7 +134,7 @@ def run_flow(session: Session, model: str | None = None, *, direct_chat: bool = 
 
 
 def stop_flow(session: Session, model: str | None = None) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     running = session.client.list_running()
     if model is not None:
         target = resolve_running(running, validate_model_name(model))
@@ -157,7 +164,7 @@ def pull_flow(session: Session, model: str | None = None) -> None:
         if model is None:
             return
     name = validate_model_name(model)
-    ensure_server(session.client)
+    ensure_running(session)
     tracker = _PullProgress()
     try:
         name = pull_model(session.client, name, on_progress=tracker.handle)
@@ -167,7 +174,7 @@ def pull_flow(session: Session, model: str | None = None) -> None:
 
 
 def create_flow(session: Session) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     while True:
         source = _menu(
             session,
@@ -211,9 +218,9 @@ def create_flow(session: Session) -> None:
 
 
 def installed_flow(session: Session) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     while True:
-        models = session.client.list_models()
+        models = _describe_installed(session)
         show_models(models)
         if not models:
             return
@@ -249,12 +256,12 @@ def installed_flow(session: Session) -> None:
 
 
 def running_flow(session: Session) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     show_running(session.client.list_running())
 
 
 def configure_flow(session: Session, model: str | None = None) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     if model is None:
         chosen = _choose_installed(session, t("Which model to configure"))
         if chosen is None:
@@ -302,7 +309,7 @@ def copy_flow(
     source: str | None = None,
     destination: str | None = None,
 ) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     models = session.client.list_models()
     if source is None:
         chosen = _choose_installed(session, t("Which model to copy"))
@@ -326,17 +333,18 @@ def copy_flow(
 
 
 def delete_flow(session: Session, model: str | None = None, *, yes: bool = False) -> None:
-    ensure_server(session.client)
-    models = session.client.list_models()
+    ensure_running(session)
     if model is None:
+        models = _describe_installed(session)
         if not models:
             raise LamaError(t("No models are installed."))
+        show_models(models)
         chosen = _menu(session, t("Which model to delete"), _installed_choices(models), search=True)
         if chosen is None:
             return
         model = chosen
     else:
-        model = resolve_installed(models, validate_model_name(model))
+        model = resolve_installed(session.client.list_models(), validate_model_name(model))
     if not yes:
         _need_confirm(session.prompter.confirm(t("Delete {name}? This cannot be undone.", name=model), default=False))
     session.client.delete(model)
@@ -344,7 +352,7 @@ def delete_flow(session: Session, model: str | None = None, *, yes: bool = False
 
 
 def show_flow(session: Session, model: str | None = None) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     models = session.client.list_models()
     if model is None:
         chosen = _choose_installed(session, t("Which model to describe"))
@@ -357,7 +365,7 @@ def show_flow(session: Session, model: str | None = None) -> None:
 
 
 def push_flow(session: Session, model: str | None = None) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     if model is None:
         chosen = _choose_installed(session, t("Which model to publish"))
         if chosen is None:
@@ -393,6 +401,129 @@ def push_flow(session: Session, model: str | None = None) -> None:
     show_success(t("Model {name} was pushed to the registry.", name=model))
 
 
+def ensure_running(session: Session) -> str:
+    """Вернуть версию API, запустив локальный сервер, если он остановлен."""
+    try:
+        return session.client.version()
+    except OllamaUnavailable as exc:
+        manager = ServerManager(session.settings, session.client, session.runner)
+        status = manager.status()
+        if status.api_up:
+            return status.version or session.client.version()
+        if not status.can_start:
+            raise OllamaUnavailable(
+                t("{reason} Start the server from the Server menu or with ollama serve.", reason=exc)
+            ) from exc
+        show_success(_launch(session, manager))
+        return session.client.version()
+
+
+def try_start_server(session: Session) -> None:
+    """Поднять локальный сервер перед меню. Отказ и удалённый адрес меню не закрывают."""
+    try:
+        session.client.version()
+        return
+    except OllamaUnavailable:
+        pass
+    except LamaError:
+        return
+    manager = ServerManager(session.settings, session.client, session.runner)
+    try:
+        status = manager.status()
+    except LamaError as exc:
+        show_error(str(exc))
+        return
+    if status.api_up or not status.can_start:
+        return
+    try:
+        show_success(_launch(session, manager))
+    except UserCancelled:
+        console.print(f"[dim]{t('Cancelled')}[/dim]")
+    except LamaError as exc:
+        show_error(str(exc))
+
+
+def restart_server(session: Session) -> str:
+    if len(discover_ollama_installs()) > 1:
+        return start_server(session)
+    return ServerManager(session.settings, session.client, session.runner).restart()
+
+
+def start_server(session: Session) -> str:
+    chosen = _choose_install(session)
+    if chosen is not None:
+        return _start_chosen(session, chosen)
+    return ServerManager(session.settings, session.client, session.runner).start()
+
+
+def _launch(session: Session, manager: ServerManager) -> str:
+    chosen = _choose_install(session)
+    if chosen is None:
+        return manager.start()
+    return _start_chosen(session, chosen)
+
+
+def _choose_install(session: Session) -> OllamaInstall | None:
+    installs = discover_ollama_installs()
+    if len(installs) <= 1:
+        if len(installs) == 1:
+            session.runner.use_binary(installs[0].path)
+        return None
+    for item in installs:
+        remember_executable(item.path, item.listen)
+    running = set(running_serve_executables(Path("/proc")))
+    choices = [_install_choice(item, running) for item in installs]
+    if not _prompt_available():
+        versions = ", ".join(title for title, _value in choices)
+        raise LamaError(
+            t(
+                "Several Ollama versions were found ({versions}). "
+                "Run lama in a terminal and choose one with the arrow keys.",
+                versions=versions,
+            )
+        )
+    picked = _menu(session, t("Which Ollama should be started?"), choices)
+    if picked is None:
+        raise UserCancelled()
+    for item in installs:
+        if item.path == picked:
+            session.runner.use_binary(item.path)
+            return item
+    raise LamaError(t("Server start is unavailable."))
+
+
+def _start_chosen(session: Session, install: OllamaInstall) -> str:
+    ServerManager(session.settings, session.client, session.runner).stop_other_than(install.path)
+    _point_session_at(session, install)
+    return ServerManager(session.settings, session.client, session.runner).start(prefer_binary=install.path)
+
+
+def _point_session_at(session: Session, install: OllamaInstall) -> None:
+    session.settings.host = client_base_for(install.listen)
+    session.settings.env_host = server_env_for(install.listen)
+    save_settings(session.settings)
+    session.client.close()
+    session.client = build_client(session.settings)
+    session.runner = build_runner(session.settings)
+    session.runner.use_binary(install.path)
+
+
+def _install_choice(item: OllamaInstall, running: set[str]) -> tuple[str, str]:
+    version = item.version or t("version unknown")
+    title = f"{version}   {item.listen}   {item.path}"
+    try:
+        resolved = os.path.realpath(item.path)
+    except OSError:
+        resolved = item.path
+    if resolved in running:
+        title = f"{title}   ({t('Running')})"
+    return title, item.path
+
+
+def _prompt_available() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def server_menu(session: Session) -> None:
     while True:
         manager = ServerManager(session.settings, session.client, session.runner)
@@ -412,11 +543,11 @@ def server_menu(session: Session) -> None:
             return
         try:
             if choice == "start":
-                show_success(manager.start())
+                show_success(start_server(session))
             elif choice == "stop":
                 show_success(manager.stop())
             elif choice == "restart":
-                show_success(manager.restart())
+                show_success(restart_server(session))
             elif choice == "logs":
                 show_text_block(t("Journal"), manager.logs())
             elif choice == "host":
@@ -433,13 +564,13 @@ def server_action(session: Session, action: str) -> None:
         show_server(manager.status())
         return
     if action == "start":
-        show_success(manager.start())
+        show_success(start_server(session))
         return
     if action == "stop":
         show_success(manager.stop())
         return
     if action == "restart":
-        show_success(manager.restart())
+        show_success(restart_server(session))
         return
     if action == "logs":
         show_text_block(t("Journal"), manager.logs())
@@ -534,12 +665,12 @@ def _show_static_resources(session: Session, *, include_runtime: bool) -> None:
 
 
 def print_installed(session: Session) -> None:
-    ensure_server(session.client)
-    show_models(session.client.list_models())
+    ensure_running(session)
+    show_models(_describe_installed(session))
 
 
 def print_running(session: Session) -> None:
-    ensure_server(session.client)
+    ensure_running(session)
     show_running(session.client.list_running())
 
 
@@ -763,10 +894,18 @@ class _PullProgress:
         self._progress.stop()
 
 
+def _describe_installed(session: Session) -> list[InstalledModel]:
+    describe = getattr(session.client, "list_models_with_parameters", None)
+    if callable(describe):
+        return describe()
+    return session.client.list_models()
+
+
 def _choose_installed(session: Session, message: str) -> str | None:
-    models = session.client.list_models()
+    models = _describe_installed(session)
     if not models:
         raise LamaError(t("No models are installed."))
+    show_models(models)
     return _menu(session, message, _installed_choices(models), search=True)
 
 
@@ -784,7 +923,20 @@ def _menu(
 
 
 def _installed_choices(models: list[InstalledModel]) -> list[tuple[str, str]]:
-    return [(f"{item.name}   {format_bytes(item.size)}", item.name) for item in models]
+    choices: list[tuple[str, str]] = []
+    for item in models:
+        title = f"{item.name}   {format_bytes(item.size)}"
+        details: list[str] = []
+        context = format_context(item.parameters, item.max_context)
+        if context != "—":
+            details.append(f"ctx {context}")
+        temperature = item.parameters.get("temperature", "").strip()
+        if temperature:
+            details.append(f"temp {temperature}")
+        if details:
+            title = f"{title}   {' · '.join(details)}"
+        choices.append((title, item.name))
+    return choices
 
 
 def _running_title(model: RunningModel) -> str:

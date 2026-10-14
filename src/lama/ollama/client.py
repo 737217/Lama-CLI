@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterator
+from dataclasses import replace
 from datetime import datetime
 
 import httpx
@@ -67,6 +68,30 @@ class OllamaClient:
             )
         return models
 
+    def list_models_with_parameters(self) -> list[InstalledModel]:
+        """Список установленных моделей с параметрами из /api/show.
+
+        /api/tags не отдаёт контекст и температуру. Один show без verbose
+        на модель: полный verbose тянет тензоры и занимает сотни миллисекунд.
+        """
+        detailed: list[InstalledModel] = []
+        for model in self.list_models():
+            try:
+                shown = self.show(model.name)
+            except OllamaUnavailable:
+                raise
+            except OllamaAPIError:
+                detailed.append(model)
+                continue
+            detailed.append(
+                replace(
+                    model,
+                    parameters=dict(shown.parameter_map),
+                    max_context=context_length_from_info(shown.model_info),
+                )
+            )
+        return detailed
+
     def list_running(self) -> list[RunningModel]:
         payload = self._request("GET", "/api/ps")
         items = payload.get("models") or []
@@ -92,7 +117,7 @@ class OllamaClient:
         return running
 
     def show(self, model: str) -> ModelShow:
-        payload = self._request("POST", "/api/show", json={"model": model, "verbose": True})
+        payload = self._request("POST", "/api/show", json={"model": model})
         parameters = _text(payload.get("parameters"))
         capabilities = payload.get("capabilities") or []
         if not isinstance(capabilities, list):
@@ -211,11 +236,28 @@ class OllamaClient:
             payload = response.json()
         except json.JSONDecodeError as exc:
             raise OllamaAPIError(t("Ollama returned a response that is not JSON.")) from exc
+        if payload is None:
+            return {}
         if not isinstance(payload, dict):
             raise OllamaAPIError(t("Ollama returned unexpected JSON."))
         if payload.get("error"):
             raise OllamaAPIError(str(payload["error"]))
         return payload
+
+
+def context_length_from_info(model_info: dict[str, object]) -> int | None:
+    """Максимальный контекст архитектуры: qwen35.context_length и аналоги."""
+    found: list[int] = []
+    for key, value in model_info.items():
+        if key != "context_length" and not str(key).endswith(".context_length"):
+            continue
+        try:
+            found.append(int(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+    if not found:
+        return None
+    return max(found)
 
 
 def parse_parameter_block(text: str) -> dict[str, str]:

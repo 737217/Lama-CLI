@@ -30,6 +30,10 @@ user-служба выбирается вместо неактивной system-
 Отсутствующий systemctl, недоступная user-шина и ручной процесс обрабатываются
 без sudo и без угадывания по имени процесса.
 
+Если пользователь выбрал конкретный файл ollama, а он не совпадает с
+``ExecStart`` неактивной службы, запускается этот файл, а служба остаётся
+остановленной. Совпадение запускает службу.
+
 Идентичность своего процесса
 -----------------------------
 Файл состояния хранит PID, время старта из ``/proc/<pid>/stat``, путь
@@ -45,6 +49,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -58,19 +63,23 @@ from lama.config import Settings, state_dir
 from lama.errors import LamaError, OllamaUnavailable
 from lama.i18n import t
 from lama.ollama.client import OllamaClient
+from lama.ollama.discover import remember_executable, serve_listen_host
 from lama.ollama.runner import OllamaRunner, build_serve_argv
+from lama.validation import normalize_host
 
 _STATE_VERSION = 1
 _WAIT_ATTEMPTS = 20
 _WAIT_INTERVAL = 0.25
 _IDENTITY_ATTEMPTS = 10
 _IDENTITY_INTERVAL = 0.05
+_EXECSTART_PATH = re.compile(r"\bpath=(\S+)")
 
 
 class ControlMode(StrEnum):
     SYSTEMD_SYSTEM = "systemd-system"
     SYSTEMD_USER = "systemd-user"
     MANAGED = "managed"
+    LISTENER = "listener"
     EXTERNAL = "external"
     STOPPED = "stopped"
     REMOTE = "remote"
@@ -224,12 +233,35 @@ class ServerManager:
         record = self._load_state()
         return self._local_status(system_unit, user_unit, record, api_up, version, api_error)
 
-    def start(self) -> str:
+    def start(self, *, prefer_binary: str | None = None) -> str:
         current = self.status()
         self._refuse_blocked(current)
         if current.api_up:
             return t("Server is already responding on {host}.", host=current.host)
         if not current.can_start:
+            raise LamaError(current.stop_reason or t("Server start is unavailable."))
+        if prefer_binary and self._unit_matches_binary(current.mode, prefer_binary):
+            try:
+                if current.mode is ControlMode.SYSTEMD_SYSTEM:
+                    self._require(_systemctl("start"))
+                    self._wait_api()
+                    return t("systemd ollama service started.")
+                if current.mode is ControlMode.SYSTEMD_USER:
+                    self._require(_systemctl("start", user=True))
+                    self._wait_api()
+                    return t("systemd user ollama service started.")
+            except LamaError:
+                up, _version, _error = self._probe_api()
+                if up:
+                    return t("Server is already responding on {host}.", host=current.host)
+            self.runner.use_binary(prefer_binary)
+            self._start_managed()
+            return t("Started ollama serve.")
+        if prefer_binary and not self._unit_matches_binary(current.mode, prefer_binary):
+            self.runner.use_binary(prefer_binary)
+            if current.mode in {ControlMode.SYSTEMD_SYSTEM, ControlMode.SYSTEMD_USER, ControlMode.STOPPED}:
+                self._start_managed()
+                return t("Started ollama serve.")
             raise LamaError(current.stop_reason or t("Server start is unavailable."))
         if current.mode is ControlMode.SYSTEMD_SYSTEM:
             self._require(_systemctl("start"))
@@ -257,6 +289,8 @@ class ServerManager:
             return t("systemd user ollama service stopped.")
         if current.mode is ControlMode.MANAGED:
             return self._stop_owned()
+        if current.mode is ControlMode.LISTENER:
+            return self._stop_listener()
         raise LamaError(current.stop_reason or t("Server stop is unavailable."))
 
     def restart(self) -> str:
@@ -393,6 +427,27 @@ class ServerManager:
                 stop_reason=_join(t(LEGACY_LIVE_REASON), state_note if state_note != t(LEGACY_LIVE_REASON) else None),
                 pid=None,
             )
+        if not system_active and not user_active and owned is None:
+            listener = self._listener_identity()
+            if listener is not None:
+                reason = None
+                if not api_up:
+                    reason = t(
+                        "ollama serve is listening on {host} (pid {pid}), but the API is not responding. "
+                        "Stop it and start it again.",
+                        host=self.settings.host,
+                        pid=listener.pid,
+                    )
+                return self._status(
+                    mode=ControlMode.LISTENER,
+                    api_up=api_up,
+                    version=version,
+                    api_error=api_error,
+                    can_start=False,
+                    can_stop=True,
+                    stop_reason=_join(reason, state_note),
+                    pid=listener.pid,
+                )
         if api_up:
             return self._status(
                 mode=ControlMode.EXTERNAL,
@@ -404,9 +459,9 @@ class ServerManager:
                 stop_reason=_join(t(EXTERNAL_STOP_REASON), state_note),
                 pid=None,
             )
-        if system_installed:
+        if system_installed and self._unit_serves_selected("system"):
             return self._start_target_status(ControlMode.SYSTEMD_SYSTEM, api_error, state_note)
-        if user_installed:
+        if user_installed and self._unit_serves_selected("user"):
             return self._start_target_status(ControlMode.SYSTEMD_USER, api_error, state_note)
         other = self._confirmed_other_endpoint(record)
         if other is not None:
@@ -573,6 +628,128 @@ class ServerManager:
             return False, None, str(exc)
         except LamaError as exc:
             return False, None, str(exc)
+
+    def _listener_identity(self) -> ProcessIdentity | None:
+        target = endpoint_port_and_addresses(self.settings.host)
+        if target is None:
+            return None
+        port, addresses = target
+        found = listening_serve_identities(
+            self._proc_root,
+            port=port,
+            addresses=addresses,
+            endpoint=self.settings.host,
+        )
+        if len(found) != 1:
+            return None
+        remember_executable(found[0].executable, serve_listen_host(self._proc_root, found[0].pid))
+        return found[0]
+
+    def stop_other_than(self, executable: str) -> None:
+        """Остановить другие локальные ``ollama serve`` и чужие активные службы."""
+        try:
+            chosen = os.path.realpath(executable)
+        except OSError:
+            chosen = executable
+        for user, scope in ((False, "system"), (True, "user")):
+            unit = self._unit(scope)
+            if unit is None or not unit.active:
+                continue
+            binary = self._unit_executable(scope)
+            if binary is not None and os.path.realpath(binary) == chosen:
+                continue
+            self._require(_systemctl("stop", user=user))
+        for identity in serve_identities(self._proc_root, endpoint=self.settings.host):
+            try:
+                exe = os.path.realpath(identity.executable)
+            except OSError:
+                exe = identity.executable
+            if exe == chosen:
+                continue
+            observation = classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+            if observation != "match":
+                continue
+            self._stop_confirmed_process(identity)
+
+    def _unit_serves_selected(self, scope: str) -> bool:
+        """Служба подходит для запуска, только если её OLLAMA_HOST обслуживает выбранный адрес."""
+        argv = ["systemctl", "show", "ollama.service", "-p", "Environment", "--no-pager"]
+        if scope == "user":
+            argv = ["systemctl", "--user", "show", "ollama.service", "-p", "Environment", "--no-pager"]
+        try:
+            result = self._executor(argv)
+        except FileNotFoundError:
+            return False
+        host = parse_environment_value(result.stdout, "OLLAMA_HOST") or "127.0.0.1:11434"
+        try:
+            return endpoint_served_by(host, self.settings.host)
+        except (LamaError, ValueError):
+            return False
+
+    def _stop_listener(self) -> str:
+        identity = self._listener_identity()
+        if identity is None:
+            raise LamaError(
+                t(
+                    "The ollama serve process listening on {host} is no longer there. No signal was sent.",
+                    host=self.settings.host,
+                )
+            )
+        return self._stop_confirmed_process(identity)
+
+    def _stop_confirmed_process(self, identity: ProcessIdentity) -> str:
+        self._signal_confirmed(identity, signal.SIGTERM)
+        outcome = self._wait_until_changed(identity)
+        if outcome == "gone":
+            return t("The ollama serve process listening on {host} has been stopped.", host=self.settings.host)
+        if outcome != "match":
+            raise LamaError(t("Process identity changed. Another process was not stopped."))
+        self._signal_confirmed(identity, signal.SIGKILL)
+        outcome = self._wait_until_changed(identity)
+        if outcome == "gone":
+            return t("The ollama serve process listening on {host} has been stopped.", host=self.settings.host)
+        raise LamaError(
+            t("The process did not exit in time. The state file was kept, and no further signal was sent.")
+        )
+
+    def _signal_confirmed(self, identity: ProcessIdentity, sig: int) -> None:
+        observation = classify_observation(identity, self._proc_root, endpoint=self.settings.host)
+        if observation == "gone":
+            raise LamaError(t("The process from the state file has already exited. No signal was sent."))
+        if observation == "mismatch":
+            raise LamaError(t("Process identity changed. Another process was not stopped."))
+        if observation != "match":
+            raise LamaError(
+                t("Could not read /proc before the signal. No signal was sent, and the state file was kept.")
+            )
+        self._kill(identity.pid, sig)
+
+    def service_binary(self, mode: ControlMode) -> str | None:
+        """Путь ExecStart неактивной или активной службы, если она есть в этом режиме."""
+        if mode is ControlMode.SYSTEMD_SYSTEM:
+            return self._unit_executable("system")
+        if mode is ControlMode.SYSTEMD_USER:
+            return self._unit_executable("user")
+        return None
+
+    def _unit_matches_binary(self, mode: ControlMode, binary: str) -> bool:
+        unit = self.service_binary(mode)
+        if unit is None:
+            return False
+        return unit == os.path.realpath(binary)
+
+    def _unit_executable(self, scope: str) -> str | None:
+        argv = ["systemctl", "show", "ollama.service", "-p", "ExecStart", "--no-pager"]
+        if scope == "user":
+            argv = ["systemctl", "--user", "show", "ollama.service", "-p", "ExecStart", "--no-pager"]
+        try:
+            result = self._executor(argv)
+        except FileNotFoundError:
+            return None
+        found = parse_execstart_path(result.stdout)
+        if not found:
+            return None
+        return os.path.realpath(found)
 
     def _unit(self, scope: str) -> UnitState | None:
         argv = ["systemctl", "show", "ollama.service", "-p", "LoadState", "-p", "ActiveState"]
@@ -765,6 +942,142 @@ class ServerManager:
             )
 
 
+def parse_environment_value(text: str, key: str) -> str | None:
+    """Достать ``KEY=value`` из вывода ``systemctl show -p Environment``."""
+    prefix = key + "="
+    for line in text.splitlines():
+        body = line[len("Environment=") :] if line.startswith("Environment=") else line
+        for token in body.split():
+            if token.startswith(prefix):
+                return token[len(prefix) :].strip('"')
+    return None
+
+
+def endpoint_served_by(unit_host: str, selected_base: str) -> bool:
+    """True, если адрес службы принимает соединения на выбранный endpoint.
+
+    Совпадают порт и хост. ``0.0.0.0`` и ``::`` обслуживают loopback на том же порту.
+    """
+    unit_base, _env = normalize_host(unit_host)
+    unit = urlparse(unit_base)
+    selected = urlparse(selected_base)
+    if (unit.port or 11434) != (selected.port or 11434):
+        return False
+    if classify_endpoint(unit_base) is EndpointScope.WILDCARD:
+        return classify_endpoint(selected_base) is EndpointScope.LOCAL
+    if _same_loopback(unit.hostname, selected.hostname):
+        return True
+    return _host_text(unit.hostname) == _host_text(selected.hostname)
+
+
+def endpoint_port_and_addresses(base_url: str) -> tuple[int, set[str]] | None:
+    """Порт и локальные адреса, которые обслуживают выбранный endpoint."""
+    parsed = urlparse(base_url)
+    host = parsed.hostname
+    if not host:
+        return None
+    port = parsed.port or 11434
+    name = host.rstrip(".").lower()
+    if name == "localhost":
+        return port, {"127.0.0.1", "::1", "0.0.0.0", "::"}
+    try:
+        address = ipaddress.ip_address(name)
+    except ValueError:
+        return None
+    if address.is_loopback or address.is_unspecified:
+        return port, {"127.0.0.1", "::1", "0.0.0.0", "::"}
+    return port, {address.compressed, "0.0.0.0", "::"}
+
+
+def parse_listening_inodes(text: str, *, port: int, addresses: set[str]) -> set[int]:
+    """Inode слушающих сокетов из ``/proc/net/tcp`` или ``tcp6``."""
+    wanted = {_normalize_ip(item) for item in addresses}
+    inodes: set[int] = set()
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 10 or ":" not in parts[1]:
+            continue
+        if parts[3] != "0A":
+            continue
+        local, separator, raw_port = parts[1].rpartition(":")
+        if not separator:
+            continue
+        try:
+            local_port = int(raw_port, 16)
+            inode = int(parts[9])
+        except ValueError:
+            continue
+        if local_port != port or inode <= 0:
+            continue
+        decoded = _decode_proc_address(local)
+        if decoded is None or _normalize_ip(decoded) not in wanted:
+            continue
+        inodes.add(inode)
+    return inodes
+
+
+def serve_identities(proc_root: Path, *, endpoint: str) -> list[ProcessIdentity]:
+    """Все процессы ``ollama serve``, которые можно прочитать в /proc."""
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    found: list[ProcessIdentity] = []
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        command = read_cmdline(int(entry.name), proc_root)
+        if not _is_serve_command(command or []):
+            continue
+        probe = probe_process(int(entry.name), proc_root, endpoint=endpoint)
+        if probe.status == "ready" and probe.identity is not None:
+            found.append(probe.identity)
+    return found
+
+
+def listening_serve_identities(
+    proc_root: Path,
+    *,
+    port: int,
+    addresses: set[str],
+    endpoint: str,
+) -> list[ProcessIdentity]:
+    """Процессы ``ollama serve``, которые слушают выбранный порт."""
+    inodes: set[int] = set()
+    for name in ("tcp", "tcp6"):
+        path = proc_root / "net" / name
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        inodes.update(parse_listening_inodes(text, port=port, addresses=addresses))
+    if not inodes:
+        return []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return []
+    found: list[ProcessIdentity] = []
+    for entry in entries:
+        if not entry.name.isdigit() or not _process_has_socket(entry, inodes):
+            continue
+        probe = probe_process(int(entry.name), proc_root, endpoint=endpoint)
+        if probe.status == "ready" and probe.identity is not None:
+            found.append(probe.identity)
+    return found
+
+
+def parse_execstart_path(text: str) -> str | None:
+    """Достать ``path=`` из вывода ``systemctl show -p ExecStart``."""
+    match = _EXECSTART_PATH.search(text)
+    if not match:
+        return None
+    raw = match.group(1).rstrip(";")
+    if not raw or raw.startswith("["):
+        return None
+    return raw
+
+
 def classify_endpoint(base_url: str) -> EndpointScope:
     """Отнести нормализованный базовый URL к локальному, wildcard или удалённому адресу.
 
@@ -939,6 +1252,68 @@ def _read_uid(path: Path) -> int | None:
             return None
         return uid
     return None
+
+
+def _host_text(host: str | None) -> str:
+    if not host:
+        return ""
+    return host.rstrip(".").lower()
+
+
+def _same_loopback(left: str | None, right: str | None) -> bool:
+    return _is_loopback_name(left) and _is_loopback_name(right)
+
+
+def _is_loopback_name(host: str | None) -> bool:
+    name = _host_text(host)
+    if name == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
+
+
+def _normalize_ip(value: str) -> str:
+    try:
+        return ipaddress.ip_address(value).compressed
+    except ValueError:
+        return value
+
+
+def _decode_proc_address(hex_ip: str) -> str | None:
+    try:
+        raw = bytes.fromhex(hex_ip)
+    except ValueError:
+        return None
+    if len(raw) == 4:
+        return ".".join(str(byte) for byte in reversed(raw))
+    if len(raw) != 16:
+        return None
+    words = [raw[index : index + 4][::-1] for index in range(0, 16, 4)]
+    try:
+        return str(ipaddress.ip_address(b"".join(words)))
+    except ValueError:
+        return None
+
+
+def _process_has_socket(proc_dir: Path, inodes: set[int]) -> bool:
+    fd_dir = proc_dir / "fd"
+    try:
+        entries = list(fd_dir.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            target = os.readlink(entry)
+        except OSError:
+            continue
+        if not target.startswith("socket:[") or not target.endswith("]"):
+            continue
+        inode = target[len("socket:[") : -1]
+        if inode.isdigit() and int(inode) in inodes:
+            return True
+    return False
 
 
 def _is_serve_command(command: list[str]) -> bool:

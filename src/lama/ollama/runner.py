@@ -91,6 +91,10 @@ class OllamaRunner:
         self._binary = found
         return found
 
+    def use_binary(self, path: str) -> None:
+        """Дальше запускать именно этот файл, а не первый ollama из PATH."""
+        self._binary = path
+
     def environment(self) -> dict[str, str]:
         env = os.environ.copy()
         env["OLLAMA_HOST"] = self.settings.env_host
